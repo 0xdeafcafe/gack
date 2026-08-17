@@ -65,8 +65,13 @@ The terminal owns graphical text selection and `Cmd+C`. Hold `Shift` while dragg
 
 The cleanest setup is a Slack app with a user token. User tokens let `gack` see the same joined conversations you can see and are required by Slack’s `search.messages` API.
 
-1. Create a Slack app from [`slack-manifest.example.yaml`](slack-manifest.example.yaml). It enables desktop-safe PKCE and registers `http://localhost:17645/oauth/callback`.
-2. Open the app’s **Basic Information** page and copy its Client ID.
+1. Ask `gack` to open Slack’s app creator with the manifest already filled in:
+
+```sh
+gack manifest --open
+```
+
+2. Pick your workspace, review the manifest, and create the app. On its **Basic Information** page, copy the Client ID.
 3. Sign in through `gack`:
 
 ```sh
@@ -75,6 +80,8 @@ gack
 ```
 
 `gack` opens Slack in your browser, waits on a localhost callback, and exchanges the result with PKCE—there is no client secret in the binary. On macOS, the resulting user token lives in your login Keychain. Run `gack logout` to remove it. The Client ID is not secret and is remembered in the normal preferences file for future logins.
+
+`gack manifest` prints the same reusable YAML to standard output when you would rather inspect it or save it yourself. The checked-in copy remains available as [`slack-manifest.example.yaml`](slack-manifest.example.yaml).
 
 If a browser cannot be opened automatically, use `gack login --no-browser`; it prints the same authorization URL. `SLACK_TOKEN` remains available for automation and temporary sessions, but it is no longer the normal setup path.
 

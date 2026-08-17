@@ -5,9 +5,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -18,6 +20,7 @@ import (
 	"github.com/0xdeafcafe/gack/internal/demo"
 	"github.com/0xdeafcafe/gack/internal/gack"
 	"github.com/0xdeafcafe/gack/internal/slack"
+	"github.com/0xdeafcafe/gack/internal/slackapp"
 	"github.com/0xdeafcafe/gack/internal/ui"
 )
 
@@ -31,6 +34,16 @@ func main() {
 			return
 		case "api":
 			runAgentAPI(os.Args[2:])
+			return
+		case "manifest":
+			err := runManifest(os.Args[2:], os.Stdout, os.Stderr, auth.OpenBrowser)
+			if errors.Is(err, flag.ErrHelp) {
+				return
+			}
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "gack manifest:", err)
+				os.Exit(1)
+			}
 			return
 		}
 	}
@@ -48,7 +61,7 @@ func main() {
 	liveMode := flag.Bool("live", false, "require a live Slack token")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Usage = func() {
-		fmt.Fprint(flag.CommandLine.Output(), "Usage: gack [--demo|--live]\n       gack login [--client-id ID] [--no-browser]\n       gack logout\n       gack api [--demo] <command> [arguments]\n\n")
+		fmt.Fprint(flag.CommandLine.Output(), "Usage: gack [--demo|--live]\n       gack manifest [--open]\n       gack login [--client-id ID] [--no-browser]\n       gack logout\n       gack api [--demo] <command> [arguments]\n\n")
 		fmt.Fprint(flag.CommandLine.Output(), "Open the terminal client, sign into a Slack workspace, or use the JSON agent API.\n\n")
 		flag.PrintDefaults()
 	}
@@ -95,6 +108,38 @@ func runAgentAPI(arguments []string) {
 	os.Exit(status)
 }
 
+func runManifest(arguments []string, stdout, stderr io.Writer, openBrowser func(string) error) error {
+	flags := flag.NewFlagSet("gack manifest", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	open := flags.Bool("open", false, "open Slack's app creator with the manifest pre-filled")
+	flags.Usage = func() {
+		fmt.Fprintln(stderr, "Usage: gack manifest [--open]")
+		fmt.Fprintln(stderr, "Print the Slack app manifest to standard output.")
+		flags.PrintDefaults()
+	}
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	if _, err := io.WriteString(stdout, slackapp.Manifest()); err != nil {
+		return fmt.Errorf("print manifest: %w", err)
+	}
+	if !*open {
+		return nil
+	}
+	if openBrowser == nil {
+		return errors.New("browser opener is unavailable")
+	}
+	fmt.Fprintln(stderr, "Opening Slack’s app creator with the manifest already filled in…")
+	fmt.Fprintln(stderr, "After Slack creates the app, copy its Client ID and run `gack login --client-id ID`.")
+	if err := openBrowser(slackapp.CreationURL()); err != nil {
+		return fmt.Errorf("open Slack app creator: %w", err)
+	}
+	return nil
+}
+
 func newBackend(demoMode, requireLive bool) (gack.Backend, error) {
 	if demoMode {
 		return demo.New(), nil
@@ -139,7 +184,7 @@ func runLogin(arguments []string, preferences *config.Preferences) {
 	flags.Parse(arguments)
 	if *clientID == "" {
 		fmt.Fprintln(os.Stderr, "gack login: pass --client-id from your Slack app’s Basic Information page")
-		fmt.Fprintln(os.Stderr, "The included slack-manifest.example.yaml configures PKCE and the localhost callback.")
+		fmt.Fprintln(os.Stderr, "Run `gack manifest --open` to create the app with the right PKCE settings and scopes.")
 		os.Exit(2)
 	}
 	present := func(target string) error {
