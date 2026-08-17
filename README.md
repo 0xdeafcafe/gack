@@ -38,6 +38,7 @@ In the demo, open `#platform`, select the Shipyard release message, and press `1
 | `i` or `1`–`9` | Use Block Kit controls on the selected message |
 | `a` / `n` | Open activity / unread notifications |
 | `Tab` | Move between the sidebar, conversation, and thread |
+| `s` (sidebar) | Cycle Manual, Alphabetical, and Attention sorting |
 | `Shift+J` / `Shift+K` | Move a channel down / up |
 | mouse drag | Reorder channels |
 | `R` | Refresh the current view |
@@ -65,25 +66,25 @@ The terminal owns graphical text selection and `Cmd+C`. Hold `Shift` while dragg
 
 The cleanest setup is a Slack app with a user token. User tokens let `gack` see the same joined conversations you can see and are required by Slack’s `search.messages` API.
 
-1. Ask `gack` to open Slack’s app creator with the manifest already filled in:
+Run the guided setup:
 
 ```sh
-gack manifest --open
+gack login
 ```
 
-2. Pick your workspace, review the manifest, and create the app. On its **Basic Information** page, copy the Client ID.
-3. Sign in through `gack`:
+The terminal walks through three explicit steps: open Slack’s pre-filled app creator, paste the numeric Client ID from **Basic Information**, then approve the workspace in your browser. It shows which control is focused, waits visibly for browser approval, and lets you retry or edit the Client ID without exposing a token.
+
+If you already have the Client ID, skip straight to confirmation:
 
 ```sh
 gack login --client-id '123456789.123456789'
-gack
 ```
 
-`gack` opens Slack in your browser, waits on a localhost callback, and exchanges the result with PKCE—there is no client secret in the binary. On macOS, the resulting user token lives in your login Keychain. Run `gack logout` to remove it. The Client ID is not secret and is remembered in the normal preferences file for future logins.
+During sign-in, gack opens Slack in your browser, waits on a localhost callback, and exchanges the result with PKCE—there is no client secret in the binary. On macOS, the resulting user token lives in your login Keychain. Run `gack logout` to remove it. The Client ID is not secret and is remembered in the normal preferences file for future logins. After setup, run `gack`.
 
-`gack manifest` prints the same reusable YAML to standard output when you would rather inspect it or save it yourself. The checked-in copy remains available as [`slack-manifest.example.yaml`](slack-manifest.example.yaml).
+`gack manifest` prints the same reusable YAML, and `gack manifest --open` opens Slack’s pre-filled creator directly when you would rather handle the steps yourself. The checked-in copy remains available as [`slack-manifest.example.yaml`](slack-manifest.example.yaml).
 
-If a browser cannot be opened automatically, use `gack login --no-browser`; it prints the same authorization URL. `SLACK_TOKEN` remains available for automation and temporary sessions, but it is no longer the normal setup path.
+If a browser cannot be opened automatically, use `gack login --client-id ID --no-browser`; it prints the same authorization URL. `SLACK_TOKEN` remains available for automation and temporary sessions, but it is no longer the normal setup path.
 
 A bot token also works, but it only sees conversations the bot has joined and legacy workspace-wide search needs a user token. Slack currently applies stricter history rate limits to some non-Marketplace apps, so the default live window is deliberately 15 messages. You can change it—within the app’s hard cap of 100—with:
 
@@ -144,6 +145,7 @@ The bridge receives normalized Block Kit actions and view submissions and can re
 - Search results and locally posted messages are bounded.
 - Conversation and message panes only format rows that can be seen around the cursor.
 - Channel lists are windowed too, including mouse hit-testing.
+- Sidebar sort modes retain one manual order and only derive alternate views; they do not duplicate channel data.
 - Network calls have deadlines, response size limits, and one rate-limit-aware retry.
 
 If you want a hard runtime ceiling as well, Go understands `GOMEMLIMIT`:
