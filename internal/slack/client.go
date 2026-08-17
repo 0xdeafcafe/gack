@@ -321,6 +321,30 @@ func (c *Client) PostMessage(ctx context.Context, channel, thread, text string) 
 	return converted[0], nil
 }
 
+func (c *Client) EditMessage(ctx context.Context, channel, ts, text string) (gack.Message, error) {
+	var response struct {
+		Channel string       `json:"channel"`
+		TS      string       `json:"ts"`
+		Text    string       `json:"text"`
+		Message slackMessage `json:"message"`
+	}
+	if err := c.call(ctx, "chat.update", map[string]any{"channel": channel, "ts": ts, "text": text}, &response); err != nil {
+		return gack.Message{}, err
+	}
+	if response.Message.TS == "" {
+		response.Message.TS = response.TS
+	}
+	if response.Message.Text == "" {
+		response.Message.Text = response.Text
+	}
+	converted := c.convertMessages(response.Channel, []slackMessage{response.Message})
+	if len(converted) == 0 {
+		return gack.Message{TS: response.TS, ChannelID: channel, Text: text, Edited: true, Time: parseTimestamp(response.TS)}, nil
+	}
+	converted[0].Edited = true
+	return converted[0], nil
+}
+
 func (c *Client) ToggleReaction(ctx context.Context, channel, ts, emoji string, remove bool) error {
 	method := "reactions.add"
 	if remove {

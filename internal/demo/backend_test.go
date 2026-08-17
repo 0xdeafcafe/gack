@@ -56,3 +56,17 @@ func TestDemoSearchAndReaction(t *testing.T) {
 		t.Fatalf("reaction not applied: %#v", messages[0].Reactions)
 	}
 }
+
+func TestDemoEditsMessageEverywhereItAppears(t *testing.T) {
+	backend := New()
+	messages, _ := backend.Messages(context.Background(), "C_GENERAL")
+	root := messages[1]
+	updated, err := backend.EditMessage(context.Background(), "C_GENERAL", root.TS, "A clearer migration note")
+	if err != nil || !updated.Edited || updated.Text != "A clearer migration note" {
+		t.Fatalf("edit: message=%#v err=%v", updated, err)
+	}
+	replies, _ := backend.Thread(context.Background(), "C_GENERAL", root.TS)
+	if replies[0].Text != updated.Text || !replies[0].Edited {
+		t.Fatalf("thread root was not updated: %#v", replies[0])
+	}
+}

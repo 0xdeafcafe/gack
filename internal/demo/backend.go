@@ -163,6 +163,35 @@ func (b *Backend) PostMessage(_ context.Context, channel, thread, text string) (
 	return m, nil
 }
 
+func (b *Backend) EditMessage(_ context.Context, channel, ts, text string) (gack.Message, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	text = strings.TrimSpace(text)
+	var updated gack.Message
+	found := false
+	update := func(messages []gack.Message) {
+		for i := range messages {
+			if messages[i].TS != ts {
+				continue
+			}
+			messages[i].Text = text
+			messages[i].Edited = true
+			updated = messages[i]
+			found = true
+		}
+	}
+	update(b.messages[channel])
+	for key, messages := range b.messages {
+		if strings.HasPrefix(key, "thread:") {
+			update(messages)
+		}
+	}
+	if !found {
+		return gack.Message{}, fmt.Errorf("message %s not found", ts)
+	}
+	return updated, nil
+}
+
 func (b *Backend) ToggleReaction(_ context.Context, channel, ts, emoji string, remove bool) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()

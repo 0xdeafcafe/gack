@@ -13,6 +13,7 @@ type Backend interface {
 	Messages(context.Context, string) ([]Message, error)
 	Thread(context.Context, string, string) ([]Message, error)
 	PostMessage(context.Context, string, string, string) (Message, error)
+	EditMessage(context.Context, string, string, string) (Message, error)
 	ToggleReaction(context.Context, string, string, string, bool) error
 	Search(context.Context, string) ([]SearchResult, error)
 	Activity(context.Context) ([]ActivityItem, error)

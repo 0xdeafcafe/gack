@@ -8,7 +8,8 @@ import (
 )
 
 type Preferences struct {
-	ChannelOrder []string `json:"channel_order,omitempty"`
+	ChannelOrder  []string `json:"channel_order,omitempty"`
+	SlackClientID string   `json:"slack_client_id,omitempty"`
 }
 
 func Path() (string, error) {

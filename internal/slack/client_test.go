@@ -38,6 +38,8 @@ func TestClientBootstrapMessagesSearchAndReaction(t *testing.T) {
 			writeJSON(writer, `{"ok":true,"messages":{"matches":[{"ts":"200.000002","user":"U2","text":"needle","channel":{"id":"C1","name":"general"}}]}}`)
 		case "reactions.add":
 			writeJSON(writer, `{"ok":true}`)
+		case "chat.update":
+			writeJSON(writer, `{"ok":true,"channel":"C1","ts":"200.000002","text":"edited","message":{"ts":"200.000002","user":"U1","text":"edited","edited":{}}}`)
 		default:
 			http.Error(writer, `{"ok":false,"error":"unknown_method"}`, http.StatusNotFound)
 		}
@@ -69,10 +71,17 @@ func TestClientBootstrapMessagesSearchAndReaction(t *testing.T) {
 	if err := client.ToggleReaction(context.Background(), "C1", "200.000002", ":eyes:", false); err != nil {
 		t.Fatal(err)
 	}
+	updated, err := client.EditMessage(context.Background(), "C1", "200.000002", "edited")
+	if err != nil || updated.Text != "edited" || !updated.Edited {
+		t.Fatalf("edit: message=%#v err=%v", updated, err)
+	}
 	mu.Lock()
 	defer mu.Unlock()
 	if called["reactions.add"] != 1 {
 		t.Fatalf("reaction endpoint calls: %#v", called)
+	}
+	if called["chat.update"] != 1 {
+		t.Fatalf("edit endpoint calls: %#v", called)
 	}
 }
 

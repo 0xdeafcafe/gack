@@ -4,6 +4,9 @@ display_information:
   background_color: "#3f1d4d"
 
 oauth_config:
+  pkce_enabled: true
+  redirect_urls:
+    - http://localhost:17645/oauth/callback
   scopes:
     user:
       - channels:history
