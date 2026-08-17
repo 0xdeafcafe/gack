@@ -318,20 +318,20 @@ func OpenBrowser(target string) error {
 
 func callbackPage(title, message string, success bool) string {
 	className := "is-error"
-	location := "NEEDS ATTENTION"
-	panelTitle := "CONNECTION INTERRUPTED"
-	badge := "[ ERROR ]"
+	status := "ACTION REQUIRED"
+	statusLabel := "Status: action required"
+	role := "alert"
 	glyph := "!"
-	prompt := "$ gack login"
-	closingNote := "Return to gack to try again. You can close this tab."
+	nextTitle := "Return to your terminal and try again"
+	nextDetail := "Run <code>gack login</code> when you’re ready."
 	if success {
 		className = "is-success"
-		location = "COMPLETE"
-		panelTitle = "CONNECTION ESTABLISHED"
-		badge = "[ OK ]"
+		status = "COMPLETE"
+		statusLabel = "Status: complete"
+		role = "status"
 		glyph = "✓"
-		prompt = "$ gack"
-		closingNote = "You can close this tab. No credentials are shown here."
+		nextTitle = "Return to your terminal"
+		nextDetail = "Gack is finishing sign-in there."
 	}
 
 	return `<!doctype html>
@@ -340,54 +340,56 @@ func callbackPage(title, message string, success bool) string {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#100e15">
 <title>` + html.EscapeString(title) + ` · gack</title>
 <style>
-:root{color-scheme:dark;--canvas:#100e15;--surface:#191620;--surface-2:#211d28;--line:#51485d;--muted:#a69cac;--text:#f8f3fa;--purple:#734181;--accent:#c792ea;--shadow:#08070a}
+:root{color-scheme:dark;--canvas:#100e15;--line:#4f4658;--muted:#aaa1b0;--text:#fbf7fc;--accent:#d49af2;--accent-soft:#2a1f31;--glow:rgba(185,105,224,.16)}
 *{box-sizing:border-box}
 html,body{min-height:100%}
-body{margin:0;background:var(--canvas);color:var(--text);font:500 15px/1.55 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace;display:grid;place-items:center;padding:24px}
-body.is-error{--accent:#ff7b72;--purple:#70383f}
-body::before{content:"";position:fixed;inset:0;pointer-events:none;background:linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.014) 1px,transparent 1px);background-size:24px 24px;mask-image:linear-gradient(to bottom,black,transparent 85%)}
-.terminal{position:relative;width:min(880px,100%);overflow:hidden;border:1px solid var(--line);border-radius:14px;background:var(--surface);box-shadow:10px 12px 0 var(--shadow),0 28px 90px rgba(0,0,0,.48);animation:arrive .35s ease-out both}
-.chrome{height:42px;padding:0 16px;display:flex;align-items:center;gap:8px;background:#151219;border-bottom:1px solid #332d39;color:var(--muted);font-size:12px;letter-spacing:.03em}
-.dot{width:10px;height:10px;border:1px solid #665d6d;border-radius:50%;background:#2a2530}.dot:first-child{background:#f06c75;border-color:#f06c75}.dot:nth-child(2){background:#e7ba58;border-color:#e7ba58}.dot:nth-child(3){background:#70c06c;border-color:#70c06c}
-.chrome-title{margin:auto}.secure{color:#8d8394}
-.appbar{min-height:36px;padding:7px 14px;display:flex;align-items:center;justify-content:space-between;gap:16px;background:var(--purple);color:#fff;font-weight:800;letter-spacing:.05em}
-.appbar small{font:700 11px/1 ui-monospace,SFMono-Regular,Menlo,monospace;opacity:.78;letter-spacing:.08em}
-.breadcrumb{padding:7px 14px;border-bottom:1px solid #3c3543;background:var(--surface-2);color:var(--muted);font-size:12px;letter-spacing:.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.breadcrumb b{padding:0 7px;color:#746a7c}.breadcrumb strong{color:var(--accent)}
-.stage{min-height:410px;padding:clamp(28px,7vw,64px);display:grid;place-items:center}
-.panel{width:min(680px,100%);border:1px solid color-mix(in srgb,var(--accent) 52%,var(--line));background:#151219;box-shadow:6px 6px 0 color-mix(in srgb,var(--accent) 14%,#09070b)}
-.panel-head{padding:9px 12px;display:flex;justify-content:space-between;gap:16px;border-bottom:1px solid var(--line);background:var(--surface-2);font-size:12px;font-weight:800;letter-spacing:.06em}.badge{color:var(--accent);white-space:nowrap}
-.content{padding:clamp(25px,5vw,44px);display:grid;grid-template-columns:56px 1fr;gap:22px;align-items:start}
-.glyph{width:48px;height:48px;display:grid;place-items:center;border:1px solid var(--accent);color:var(--accent);font-size:26px;font-weight:900;box-shadow:3px 3px 0 color-mix(in srgb,var(--accent) 22%,transparent)}
-h1{margin:-5px 0 10px;color:var(--accent);font-size:clamp(24px,4vw,38px);line-height:1.15;letter-spacing:-.035em}
-p{margin:0;color:#d9d1dc;overflow-wrap:anywhere}.prompt{margin-top:24px;padding:10px 12px;border-left:2px solid var(--accent);background:#201b25;color:#f3edf5}.cursor{display:inline-block;width:8px;height:1.1em;margin-left:5px;vertical-align:-.18em;background:var(--accent);animation:blink 1s steps(1,end) infinite}
-.foot{padding:10px 14px;border-top:1px solid #37303d;color:var(--muted);font-size:11px;letter-spacing:.025em}.foot span{color:var(--accent)}
-@keyframes blink{50%{opacity:0}}@keyframes arrive{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-@media(max-width:560px){body{padding:12px}.terminal{border-radius:9px}.secure{display:none}.stage{min-height:360px;padding:24px 16px}.content{grid-template-columns:1fr;gap:18px}.glyph{width:42px;height:42px}.panel-head{font-size:10px}.foot{font-size:10px}}
-@media(prefers-reduced-motion:reduce){.terminal,.cursor{animation:none}}
+body{margin:0;background:var(--canvas);color:var(--text);font:500 16px/1.6 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace}
+body.is-error{--accent:#ff8b82;--accent-soft:#321f25;--glow:rgba(255,91,82,.13)}
+body::before{content:"";position:fixed;inset:0;pointer-events:none;background:radial-gradient(circle at 50% 38%,var(--glow),transparent 42%),linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.014) 1px,transparent 1px);background-size:auto,32px 32px,32px 32px;mask-image:linear-gradient(to bottom,black,transparent 92%)}
+.page{position:relative;width:min(780px,100%);min-height:100vh;margin:auto;padding:clamp(24px,5vw,56px);display:grid;grid-template-rows:auto 1fr auto}
+.masthead{padding-bottom:18px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:24px}
+.brand{font-size:14px;font-weight:900;letter-spacing:.09em}
+.status-badge{display:inline-flex;align-items:center;gap:8px;padding:5px 9px;border:1px solid var(--accent);background:var(--accent-soft);color:var(--accent);font-size:11px;font-weight:900;line-height:1;letter-spacing:.08em;white-space:nowrap}
+.status-badge::before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 12px currentColor}
+.result{align-self:center;padding:clamp(64px,12vh,120px) 0 clamp(52px,10vh,96px);animation:arrive .35s ease-out both}
+.glyph{margin:0 0 24px;color:var(--accent);font-size:clamp(46px,10vw,72px);font-weight:900;line-height:1}
+.eyebrow{margin:0 0 12px;color:var(--accent);font-size:12px;font-weight:900;letter-spacing:.16em}
+h1{max-width:680px;margin:0;color:var(--text);font-size:clamp(34px,7vw,64px);line-height:1.03;letter-spacing:-.055em;overflow-wrap:anywhere}
+.message{max-width:650px;margin:24px 0 0;color:#d7cfdc;font-size:clamp(16px,2.5vw,19px);overflow-wrap:anywhere}
+.next{margin-top:clamp(48px,9vh,80px);padding:20px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);display:grid;grid-template-columns:88px 1fr;gap:18px}
+.next-label{margin:2px 0 0;color:var(--accent);font-size:11px;font-weight:900;letter-spacing:.14em}
+.next-title{margin:0;color:var(--text);font-size:clamp(17px,3vw,22px);font-weight:800;line-height:1.3}.next-detail{margin:5px 0 0;color:var(--muted);font-size:14px}
+code{padding:.08em .35em;border:1px solid var(--line);background:var(--accent-soft);color:var(--text);font:inherit}
+.foot{padding-top:18px;color:var(--muted);font-size:11px;letter-spacing:.03em}.foot strong{color:var(--accent)}
+@keyframes arrive{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@media(max-width:560px){.page{padding:22px}.masthead{align-items:flex-start;flex-direction:column;gap:12px}.result{padding:56px 0 44px}.next{grid-template-columns:1fr;gap:8px}.next-label{margin:0}}
+@media(prefers-reduced-motion:reduce){.result{animation:none}}
+@media(forced-colors:active){.status-badge{forced-color-adjust:none;background:Canvas;color:CanvasText}.status-badge::before{box-shadow:none}}
 </style>
 </head>
 <body class="` + className + `">
-<main class="terminal" aria-labelledby="result-title">
-  <div class="chrome" aria-hidden="true"><i class="dot"></i><i class="dot"></i><i class="dot"></i><span class="chrome-title">gack — localhost</span><span class="secure">LOCAL CALLBACK</span></div>
-  <header class="appbar"><span>GACK / SLACK AUTH</span><small>SECURE HANDOFF</small></header>
-  <nav class="breadcrumb" aria-label="Sign-in progress">YOU ARE HERE <b>›</b> SIGN IN <b>›</b> <strong>` + location + `</strong></nav>
-  <section class="stage">
-    <div class="panel" role="status" aria-live="polite">
-      <div class="panel-head"><span>` + panelTitle + `</span><span class="badge">` + badge + `</span></div>
-      <div class="content">
-        <div class="glyph" aria-hidden="true">` + glyph + `</div>
-        <div>
-          <h1 id="result-title">` + html.EscapeString(title) + `</h1>
-          <p>` + html.EscapeString(message) + `</p>
-          <div class="prompt" aria-hidden="true">` + prompt + `<i class="cursor"></i></div>
-        </div>
+<main class="page" aria-labelledby="result-title">
+  <header class="masthead">
+    <div class="brand">GACK / SLACK AUTH</div>
+    <div class="status-badge" aria-label="` + statusLabel + `">` + status + `</div>
+  </header>
+  <section class="result" role="` + role + `" aria-live="polite" aria-atomic="true">
+    <div class="glyph" aria-hidden="true">` + glyph + `</div>
+    <p class="eyebrow">SLACK HANDOFF</p>
+    <h1 id="result-title">` + html.EscapeString(title) + `</h1>
+    <p class="message">` + html.EscapeString(message) + `</p>
+    <div class="next">
+      <p class="next-label">NEXT</p>
+      <div>
+        <p class="next-title">` + nextTitle + `</p>
+        <p class="next-detail">` + nextDetail + `</p>
       </div>
-      <div class="foot"><span>●</span> ` + closingNote + `</div>
     </div>
   </section>
+  <footer class="foot"><strong>●</strong> Safe to close this tab · No credentials are displayed</footer>
 </main>
 </body>
 </html>`

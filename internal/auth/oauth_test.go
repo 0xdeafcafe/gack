@@ -405,18 +405,43 @@ func TestCallbackPageEscapesContent(t *testing.T) {
 	}
 }
 
-func TestCallbackPageRendersTerminalStates(t *testing.T) {
+func TestCallbackPageRendersAuthStates(t *testing.T) {
 	success := callbackPage("Authorization received", "Return to gack.", true)
-	for _, want := range []string{"GACK / SLACK AUTH", "CONNECTION ESTABLISHED", "[ OK ]", "COMPLETE", "You can close this tab", `role="status"`} {
+	for _, want := range []string{
+		"GACK / SLACK AUTH",
+		"COMPLETE",
+		`aria-label="Status: complete"`,
+		`role="status"`,
+		"Authorization received",
+		"Return to your terminal",
+		"Gack is finishing sign-in there.",
+		"Safe to close this tab",
+	} {
 		if !strings.Contains(success, want) {
 			t.Errorf("success page missing %q", want)
 		}
 	}
 
 	failure := callbackPage("Couldn’t sign in", "state did not match", false)
-	for _, want := range []string{"CONNECTION INTERRUPTED", "[ ERROR ]", "NEEDS ATTENTION", "gack login", "state did not match"} {
+	for _, want := range []string{
+		"ACTION REQUIRED",
+		`aria-label="Status: action required"`,
+		`role="alert"`,
+		"Couldn’t sign in",
+		"Return to your terminal and try again",
+		"<code>gack login</code>",
+		"state did not match",
+	} {
 		if !strings.Contains(failure, want) {
 			t.Errorf("failure page missing %q", want)
+		}
+	}
+
+	for _, page := range []string{success, failure} {
+		for _, fakeWindowElement := range []string{`class="terminal"`, `class="chrome"`, `class="panel"`} {
+			if strings.Contains(page, fakeWindowElement) {
+				t.Errorf("callback page still contains fake window element %q", fakeWindowElement)
+			}
 		}
 	}
 }
