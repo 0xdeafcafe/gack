@@ -177,6 +177,8 @@ Still intentionally missing: files, message deletion, huddles, canvases, custom 
 
 ## Build it
 
+The UI core uses a single-queue, event → reducer → effect architecture; see [the architecture note](docs/architecture.md) for the boundaries and extension pattern.
+
 ```sh
 make check   # format check, vet, and tests
 make build   # ./bin/gack
