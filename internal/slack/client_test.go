@@ -27,8 +27,8 @@ func TestClientBootstrapMessagesSearchAndReaction(t *testing.T) {
 			writeJSON(writer, `{"ok":true,"user_id":"U1","user":"alex","team":"Acme"}`)
 		case "users.list":
 			writeJSON(writer, `{"ok":true,"members":[{"id":"U1","name":"alex","profile":{"display_name":"Alex"}},{"id":"U2","name":"maya","profile":{"real_name":"Maya"}}]}`)
-		case "conversations.list":
-			writeJSON(writer, `{"ok":true,"channels":[{"id":"C1","name":"general","is_member":true,"topic":{"value":"Hello"}},{"id":"D1","user":"U2","is_im":true,"unread_count_display":2},{"id":"C1","name":"general","is_member":true}]}`)
+		case "users.conversations":
+			writeJSON(writer, `{"ok":true,"channels":[{"id":"C1","name":"general","topic":{"value":"Hello"}},{"id":"D1","user":"U2","is_im":true,"unread_count_display":2},{"id":"C1","name":"general"}]}`)
 		case "conversations.history":
 			writeJSON(writer, `{"ok":true,"messages":[
           {"type":"message","ts":"200.000002","user":"U2","text":"newer"},
@@ -82,6 +82,9 @@ func TestClientBootstrapMessagesSearchAndReaction(t *testing.T) {
 	}
 	if called["chat.update"] != 1 {
 		t.Fatalf("edit endpoint calls: %#v", called)
+	}
+	if called["users.conversations"] != 1 || called["conversations.list"] != 0 {
+		t.Fatalf("bootstrap did not use the membership-scoped endpoint: %#v", called)
 	}
 }
 

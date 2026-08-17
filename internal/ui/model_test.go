@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -17,13 +18,70 @@ func readyDemoModel(t *testing.T, width, height int) *Model {
 	t.Helper()
 	model := New(demo.New(), nil, nil)
 	model.Update(tea.WindowSizeMsg{Width: width, Height: height})
-	bootstrap := model.Init()
-	_, load := model.Update(bootstrap())
+	model.Init()
+	_, load := model.Update(bootstrapCmd(model.backend)())
 	if load == nil {
 		t.Fatal("bootstrap did not request messages")
 	}
 	model.Update(load())
 	return model
+}
+
+func TestConnectingAndRecoveryStatesAreActionable(t *testing.T) {
+	model := New(demo.New(), nil, nil)
+	model.Update(tea.WindowSizeMsg{Width: 120, Height: 36})
+	model.Init()
+	connecting := ansi.Strip(model.View())
+	for _, want := range []string{"CONNECTING TO SLACK", "Opening your workspace", "people, and joined conversations", "q cancel"} {
+		if !strings.Contains(connecting, want) {
+			t.Errorf("connecting view is missing %q", want)
+		}
+	}
+
+	model.Update(bootstrapResult{err: fmt.Errorf("load conversations: %w", context.DeadlineExceeded)})
+	recovery := ansi.Strip(model.View())
+	for _, want := range []string{"SLACK TOOK TOO LONG TO ANSWER", "R  TRY AGAIN", "L  SIGN IN AGAIN", "R retry", "Nothing was changed"} {
+		if !strings.Contains(recovery, want) {
+			t.Errorf("recovery view is missing %q", want)
+		}
+	}
+	if strings.Count(recovery, "load conversations: context deadline exceeded") != 1 {
+		t.Fatalf("technical error should appear once:\n%s", recovery)
+	}
+	_, retry := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("r")})
+	if retry == nil || model.err != "" || model.busy == "" {
+		t.Fatal("retry did not restart the connection")
+	}
+
+	model.Update(bootstrapResult{err: context.DeadlineExceeded})
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	if model.RequestedExit() != ExitLogin {
+		t.Fatalf("requested exit = %d, want login", model.RequestedExit())
+	}
+	assertViewFits(t, model)
+}
+
+func TestConnectingAndRecoveryFitCompactTerminals(t *testing.T) {
+	for _, size := range []struct{ width, height int }{{80, 24}, {42, 18}, {30, 10}} {
+		model := New(demo.New(), nil, nil)
+		model.Update(tea.WindowSizeMsg{Width: size.width, Height: size.height})
+		model.Init()
+		assertViewFits(t, model)
+		model.Update(bootstrapResult{err: context.DeadlineExceeded})
+		assertViewFits(t, model)
+	}
+}
+
+func TestAvailableUpdateAppearsInHeaderAndCanBeSelected(t *testing.T) {
+	model := readyDemoModel(t, 120, 36)
+	model.Update(versionResult{latest: "v0.4.0"})
+	if view := ansi.Strip(model.View()); !strings.Contains(view, "v0.4.0") || !strings.Contains(view, "u update") {
+		t.Fatalf("update banner missing:\n%s", view)
+	}
+	model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("u")})
+	if model.RequestedExit() != ExitUpdate {
+		t.Fatalf("requested exit = %d, want update", model.RequestedExit())
+	}
 }
 
 func TestViewFitsTerminal(t *testing.T) {

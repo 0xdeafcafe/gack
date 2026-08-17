@@ -189,11 +189,15 @@ func (c *Client) loadConversations(ctx context.Context, users map[string]gack.Us
 		if cursor != "" {
 			params["cursor"] = cursor
 		}
-		if err := c.call(ctx, "conversations.list", params, &response); err != nil {
+		// users.conversations returns only conversations the authenticated user
+		// or bot belongs to. conversations.list returns every public channel in
+		// the workspace, which can require dozens of irrelevant pages in a large
+		// Slack and exhaust the whole bootstrap deadline.
+		if err := c.call(ctx, "users.conversations", params, &response); err != nil {
 			return nil, err
 		}
 		for _, source := range response.Channels {
-			if source.IsArchived || (!source.IsMember && !source.IsIM) {
+			if source.IsArchived {
 				continue
 			}
 			// A conversation can occasionally be repeated across cursor pages while
@@ -213,7 +217,8 @@ func (c *Client) loadConversations(ctx context.Context, users map[string]gack.Us
 			result = append(result, gack.Conversation{
 				ID: source.ID, Name: name, DisplayName: display, UserID: source.User,
 				Topic: source.Topic.Value, IsDM: source.IsIM, IsPrivate: source.IsPrivate,
-				IsMember: source.IsMember || source.IsIM, IsArchived: source.IsArchived,
+				// users.conversations is membership-scoped and may omit is_member.
+				IsMember: true, IsArchived: source.IsArchived,
 				IsFavorite: source.IsStarred, Unread: source.UnreadCountDisplay, LastRead: source.LastRead,
 			})
 		}

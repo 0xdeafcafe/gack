@@ -73,7 +73,9 @@ func (m *Model) View() string {
 
 func (m *Model) renderHeader() string {
 	location := "Starting"
-	if m.ready {
+	if !m.ready && m.err != "" {
+		location = "Connection problem"
+	} else if m.ready {
 		switch m.mode {
 		case viewActivity:
 			location = "Activity"
@@ -93,6 +95,15 @@ func (m *Model) renderHeader() string {
 		left = " GACK"
 	}
 	command := "Ctrl+K  commands "
+	if !m.ready {
+		command = "q  cancel "
+		if m.err != "" {
+			command = "R retry  ·  L sign in "
+		}
+	}
+	if m.updateAvailable != "" && m.ready {
+		command = "↑ " + m.updateAvailable + "  ·  u update "
+	}
 	brandLine := joinAcross(left, command, max(1, m.width))
 	brandLine = headerStyle.Width(max(0, m.width)).Render(brandLine)
 
@@ -108,6 +119,11 @@ func (m *Model) renderFooter() string {
 	var value string
 	style := footerStyle
 	switch {
+	case !m.ready && m.err != "":
+		value = "RECOVERY · R retry · L sign in again · q quit"
+		style = lipgloss.NewStyle().Foreground(warning).Bold(true)
+	case !m.ready && m.busy != "":
+		value = m.spin.View() + " Connecting to Slack · q cancel"
 	case m.dialog != nil:
 		value = m.dialogFooter()
 	case m.overlay == overlayGlobalSearch:
@@ -158,11 +174,7 @@ func (m *Model) renderComposer() string {
 
 func (m *Model) renderBody(height int) string {
 	if !m.ready {
-		message := m.busy
-		if m.err != "" {
-			message = errorStyle.Render(m.err)
-		}
-		return lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, message)
+		return m.renderStartup(height)
 	}
 	sidebarWidth := m.sidebarWidth()
 	if sidebarWidth >= m.width {
@@ -189,6 +201,65 @@ func (m *Model) renderBody(height int) string {
 		content = m.renderConversation(available, height)
 	}
 	return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, content)
+}
+
+func (m *Model) renderStartup(height int) string {
+	boxWidth := max(8, min(68, m.width-2))
+	inner := max(4, boxWidth-6)
+	var lines []string
+	if m.err == "" {
+		elapsed := ""
+		if !m.connectStarted.IsZero() {
+			elapsed = fmt.Sprintf("%ds", max(0, int(time.Since(m.connectStarted).Round(time.Second)/time.Second)))
+		}
+		lines = []string{
+			joinAcross(selectedStyle.Render("CONNECTING TO SLACK"), dimStyle.Render(elapsed), inner),
+			"",
+			m.spin.View() + "  Opening your workspace",
+			"",
+			dimStyle.Render("Checking the session, people, and joined conversations."),
+		}
+		if time.Since(m.connectStarted) > 8*time.Second {
+			lines = append(lines, "", dimStyle.Render("Still working — large workspaces can take a few seconds."))
+		}
+	} else {
+		title, explanation := friendlyConnectionError(m.err)
+		lines = []string{
+			errorStyle.Render(title),
+			"",
+		}
+		lines = append(lines, wrapText(explanation, max(8, inner-2))...)
+		lines = append(lines,
+			"",
+			dimStyle.Render("Nothing was changed. You can retry safely."),
+			"",
+			selectedNav.Render(" R  TRY AGAIN ")+"  "+selectedStyle.Render("L  SIGN IN AGAIN"),
+			"",
+			dimStyle.Render(truncate(oneLine(m.err), inner-2)),
+		)
+	}
+	content := cropLines(strings.Join(lines, "\n"), max(1, height-4), inner)
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(purple).
+		Width(inner).
+		Padding(1).
+		Render(content)
+	return centerBlock(box, m.width, height)
+}
+
+func friendlyConnectionError(value string) (string, string) {
+	lower := strings.ToLower(value)
+	switch {
+	case strings.Contains(lower, "context deadline exceeded") || strings.Contains(lower, "client.timeout"):
+		return "SLACK TOOK TOO LONG TO ANSWER", "The network or Slack API timed out while loading this workspace."
+	case strings.Contains(lower, "invalid_auth"), strings.Contains(lower, "token_expired"), strings.Contains(lower, "token_revoked"):
+		return "YOUR SLACK LOGIN NEEDS ATTENTION", "Sign in again to replace the expired or revoked workspace session."
+	case strings.Contains(lower, "missing_scope"):
+		return "THE SLACK APP NEEDS ANOTHER PERMISSION", "Update the app scopes, reinstall it, then sign in again."
+	default:
+		return "COULDN’T OPEN THIS WORKSPACE", "Slack returned an error while gack was preparing the conversation view."
+	}
 }
 
 func (m *Model) sidebarWidth() int {
@@ -726,6 +797,9 @@ func (m *Model) renderHelp(background string, height int) string {
 
 func (m *Model) focusPath() string {
 	if !m.ready {
+		if m.err != "" {
+			return "Recovery › R retry or L sign in"
+		}
 		return "Connecting"
 	}
 	if m.dialog != nil {
@@ -963,6 +1037,27 @@ func styleLines(value string, style lipgloss.Style, width int) string {
 		lines[index] = style.Width(width).Render(truncateANSI(lines[index], width))
 	}
 	return strings.Join(lines, "\n")
+}
+
+func centerBlock(value string, width, height int) string {
+	value = cropLines(value, height, width)
+	lines := strings.Split(value, "\n")
+	top := max(0, (height-len(lines))/2)
+	result := make([]string, 0, height)
+	blank := strings.Repeat(" ", max(1, width))
+	for range top {
+		result = append(result, blank)
+	}
+	for _, line := range lines {
+		result = append(result, lipgloss.PlaceHorizontal(width, lipgloss.Center, line))
+	}
+	for len(result) < height {
+		result = append(result, blank)
+	}
+	if len(result) > height {
+		result = result[:height]
+	}
+	return strings.Join(result, "\n")
 }
 
 func joinAcross(left, right string, width int) string {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/atotto/clipboard"
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -58,6 +59,14 @@ type sidebarSaveState struct {
 	mutex  sync.Mutex
 }
 
+type ExitAction uint8
+
+const (
+	ExitNone ExitAction = iota
+	ExitLogin
+	ExitUpdate
+)
+
 type Model struct {
 	backend     gack.Backend
 	saveSidebar func(config.SidebarPreferences) error
@@ -71,6 +80,12 @@ type Model struct {
 	busy   string
 	status string
 	err    string
+	spin   spinner.Model
+
+	connectStarted  time.Time
+	checkUpdate     func(context.Context) (string, error)
+	updateAvailable string
+	exitAction      ExitAction
 
 	snapshot gack.Snapshot
 	channels []gack.Conversation
@@ -148,19 +163,34 @@ func NewWithSidebar(backend gack.Backend, preferences config.SidebarPreferences,
 	compose.MaxHeight = 8
 	compose.SetHeight(4)
 	compose.SetWidth(72)
+	progress := spinner.New()
+	progress.Spinner = spinner.Dot
+	progress.Style = selectedStyle
 	return &Model{
 		backend: backend, saveSidebar: saveSidebar, saveState: &sidebarSaveState{},
 		order: append([]string(nil), preferences.ChannelOrder...), sidebarSort: preferences.Sort.Normalize(),
 		channel: -1, message: -1, threadAt: -1, activityAt: 0,
 		focus: focusSidebar, searchInput: search, findInput: find,
-		composeInput: compose, dragFrom: -1, dragAt: -1,
+		composeInput: compose, spin: progress, dragFrom: -1, dragAt: -1,
 	}
 }
 
 func (m *Model) Init() tea.Cmd {
-	m.busy = "Connecting…"
-	return bootstrapCmd(m.backend)
+	m.startConnecting()
+	commands := []tea.Cmd{m.spin.Tick, bootstrapCmd(m.backend)}
+	if m.checkUpdate != nil {
+		commands = append(commands, checkUpdateCmd(m.checkUpdate))
+	}
+	return tea.Batch(commands...)
 }
+
+// SetUpdateCheck adds a bounded background version check. Errors are silent in
+// the TUI; the explicit `gack update --check` command reports diagnostics.
+func (m *Model) SetUpdateCheck(check func(context.Context) (string, error)) { m.checkUpdate = check }
+
+// RequestedExit tells the command wrapper whether the user chose an in-place
+// login repair or update from a recovery/banner action.
+func (m *Model) RequestedExit() ExitAction { return m.exitAction }
 
 type bootstrapResult struct {
 	snapshot gack.Snapshot
@@ -224,6 +254,19 @@ type sidebarSaved struct {
 	err      error
 }
 type copiedResult struct{ err error }
+type versionResult struct {
+	latest string
+	err    error
+}
+
+func checkUpdateCmd(check func(context.Context) (string, error)) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		latest, err := check(ctx)
+		return versionResult{latest: latest, err: err}
+	}
+}
 
 func bootstrapCmd(backend gack.Backend) tea.Cmd {
 	return func() tea.Msg {
@@ -364,6 +407,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.focus = focusMessages
 		m.busy = "Loading messages…"
 		return m, messagesCmd(m.backend, m.channels[m.channel].ID)
+	case spinner.TickMsg:
+		if m.busy == "" {
+			return m, nil
+		}
+		var command tea.Cmd
+		m.spin, command = m.spin.Update(msg)
+		return m, command
+	case versionResult:
+		if msg.err == nil {
+			m.updateAvailable = msg.latest
+		}
+		return m, nil
 	case messagesResult:
 		if msg.channel != m.currentChannelID() {
 			return m, nil
@@ -507,6 +562,26 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if key == "ctrl+c" {
 		return m, tea.Quit
 	}
+	if !m.ready {
+		if m.err != "" {
+			switch key {
+			case "r", "R", "enter":
+				m.startConnecting()
+				return m, tea.Batch(m.spin.Tick, bootstrapCmd(m.backend))
+			case "l":
+				m.exitAction = ExitLogin
+				return m, tea.Quit
+			}
+		}
+		if key == "q" || key == "esc" {
+			return m, tea.Quit
+		}
+		return m, nil
+	}
+	if key == "u" && m.updateAvailable != "" {
+		m.exitAction = ExitUpdate
+		return m, tea.Quit
+	}
 	if m.dialog != nil {
 		return m, m.updateDialog(msg)
 	}
@@ -586,6 +661,14 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.updateActivity(key)
 	}
 	return m, m.updateConversation(key)
+}
+
+func (m *Model) startConnecting() {
+	m.ready = false
+	m.err = ""
+	m.status = ""
+	m.busy = "Connecting…"
+	m.connectStarted = time.Now()
 }
 
 func (m *Model) updateSidebar(key string) tea.Cmd {
