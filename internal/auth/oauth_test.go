@@ -396,9 +396,28 @@ func TestRefreshValidation(t *testing.T) {
 }
 
 func TestCallbackPageEscapesContent(t *testing.T) {
-	page := callbackPage(`<script>alert(1)</script>`, `<img src=x onerror=alert(1)>`)
+	page := callbackPage(`<script>alert(1)</script>`, `<img src=x onerror=alert(1)>`, true)
 	if strings.Contains(page, "<script>") || strings.Contains(page, "<img") {
 		t.Fatalf("callback page contains unescaped content: %s", page)
+	}
+	if !strings.Contains(page, "&lt;script&gt;") || !strings.Contains(page, "&lt;img") {
+		t.Fatalf("callback page did not preserve escaped content: %s", page)
+	}
+}
+
+func TestCallbackPageRendersTerminalStates(t *testing.T) {
+	success := callbackPage("Authorization received", "Return to gack.", true)
+	for _, want := range []string{"GACK / SLACK AUTH", "CONNECTION ESTABLISHED", "[ OK ]", "COMPLETE", "You can close this tab", `role="status"`} {
+		if !strings.Contains(success, want) {
+			t.Errorf("success page missing %q", want)
+		}
+	}
+
+	failure := callbackPage("Couldn’t sign in", "state did not match", false)
+	for _, want := range []string{"CONNECTION INTERRUPTED", "[ ERROR ]", "NEEDS ATTENTION", "gack login", "state did not match"} {
+		if !strings.Contains(failure, want) {
+			t.Errorf("failure page missing %q", want)
+		}
 	}
 }
 

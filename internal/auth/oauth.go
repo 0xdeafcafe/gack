@@ -101,9 +101,9 @@ func (o OAuth) Login(ctx context.Context) (Credential, error) {
 		writer.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if result.err != nil {
 			writer.WriteHeader(http.StatusBadRequest)
-			fmt.Fprint(writer, callbackPage("Couldn’t sign in", result.err.Error()))
+			fmt.Fprint(writer, callbackPage("Couldn’t sign in", result.err.Error(), false))
 		} else {
-			fmt.Fprint(writer, callbackPage("Authorization received", "Return to gack to finish signing in."))
+			fmt.Fprint(writer, callbackPage("Authorization received", "Slack handed the session back safely. Gack will continue in your terminal.", true))
 		}
 		select {
 		case callback <- result:
@@ -316,8 +316,81 @@ func OpenBrowser(target string) error {
 	return command.Start()
 }
 
-func callbackPage(title, message string) string {
-	return `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>` + html.EscapeString(title) + ` · gack</title><style>body{margin:0;background:#17141f;color:#f7f3f8;font:18px system-ui;display:grid;place-items:center;min-height:100vh}.card{max-width:32rem;padding:3rem;border:1px solid #6e3a78;border-radius:1rem;background:#26232b}h1{color:#c792ea}</style><main class="card"><h1>` + html.EscapeString(title) + `</h1><p>` + html.EscapeString(message) + `</p></main>`
+func callbackPage(title, message string, success bool) string {
+	className := "is-error"
+	location := "NEEDS ATTENTION"
+	panelTitle := "CONNECTION INTERRUPTED"
+	badge := "[ ERROR ]"
+	glyph := "!"
+	prompt := "$ gack login"
+	closingNote := "Return to gack to try again. You can close this tab."
+	if success {
+		className = "is-success"
+		location = "COMPLETE"
+		panelTitle = "CONNECTION ESTABLISHED"
+		badge = "[ OK ]"
+		glyph = "✓"
+		prompt = "$ gack"
+		closingNote = "You can close this tab. No credentials are shown here."
+	}
+
+	return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>` + html.EscapeString(title) + ` · gack</title>
+<style>
+:root{color-scheme:dark;--canvas:#100e15;--surface:#191620;--surface-2:#211d28;--line:#51485d;--muted:#a69cac;--text:#f8f3fa;--purple:#734181;--accent:#c792ea;--shadow:#08070a}
+*{box-sizing:border-box}
+html,body{min-height:100%}
+body{margin:0;background:var(--canvas);color:var(--text);font:500 15px/1.55 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace;display:grid;place-items:center;padding:24px}
+body.is-error{--accent:#ff7b72;--purple:#70383f}
+body::before{content:"";position:fixed;inset:0;pointer-events:none;background:linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.014) 1px,transparent 1px);background-size:24px 24px;mask-image:linear-gradient(to bottom,black,transparent 85%)}
+.terminal{position:relative;width:min(880px,100%);overflow:hidden;border:1px solid var(--line);border-radius:14px;background:var(--surface);box-shadow:10px 12px 0 var(--shadow),0 28px 90px rgba(0,0,0,.48);animation:arrive .35s ease-out both}
+.chrome{height:42px;padding:0 16px;display:flex;align-items:center;gap:8px;background:#151219;border-bottom:1px solid #332d39;color:var(--muted);font-size:12px;letter-spacing:.03em}
+.dot{width:10px;height:10px;border:1px solid #665d6d;border-radius:50%;background:#2a2530}.dot:first-child{background:#f06c75;border-color:#f06c75}.dot:nth-child(2){background:#e7ba58;border-color:#e7ba58}.dot:nth-child(3){background:#70c06c;border-color:#70c06c}
+.chrome-title{margin:auto}.secure{color:#8d8394}
+.appbar{min-height:36px;padding:7px 14px;display:flex;align-items:center;justify-content:space-between;gap:16px;background:var(--purple);color:#fff;font-weight:800;letter-spacing:.05em}
+.appbar small{font:700 11px/1 ui-monospace,SFMono-Regular,Menlo,monospace;opacity:.78;letter-spacing:.08em}
+.breadcrumb{padding:7px 14px;border-bottom:1px solid #3c3543;background:var(--surface-2);color:var(--muted);font-size:12px;letter-spacing:.04em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.breadcrumb b{padding:0 7px;color:#746a7c}.breadcrumb strong{color:var(--accent)}
+.stage{min-height:410px;padding:clamp(28px,7vw,64px);display:grid;place-items:center}
+.panel{width:min(680px,100%);border:1px solid color-mix(in srgb,var(--accent) 52%,var(--line));background:#151219;box-shadow:6px 6px 0 color-mix(in srgb,var(--accent) 14%,#09070b)}
+.panel-head{padding:9px 12px;display:flex;justify-content:space-between;gap:16px;border-bottom:1px solid var(--line);background:var(--surface-2);font-size:12px;font-weight:800;letter-spacing:.06em}.badge{color:var(--accent);white-space:nowrap}
+.content{padding:clamp(25px,5vw,44px);display:grid;grid-template-columns:56px 1fr;gap:22px;align-items:start}
+.glyph{width:48px;height:48px;display:grid;place-items:center;border:1px solid var(--accent);color:var(--accent);font-size:26px;font-weight:900;box-shadow:3px 3px 0 color-mix(in srgb,var(--accent) 22%,transparent)}
+h1{margin:-5px 0 10px;color:var(--accent);font-size:clamp(24px,4vw,38px);line-height:1.15;letter-spacing:-.035em}
+p{margin:0;color:#d9d1dc;overflow-wrap:anywhere}.prompt{margin-top:24px;padding:10px 12px;border-left:2px solid var(--accent);background:#201b25;color:#f3edf5}.cursor{display:inline-block;width:8px;height:1.1em;margin-left:5px;vertical-align:-.18em;background:var(--accent);animation:blink 1s steps(1,end) infinite}
+.foot{padding:10px 14px;border-top:1px solid #37303d;color:var(--muted);font-size:11px;letter-spacing:.025em}.foot span{color:var(--accent)}
+@keyframes blink{50%{opacity:0}}@keyframes arrive{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@media(max-width:560px){body{padding:12px}.terminal{border-radius:9px}.secure{display:none}.stage{min-height:360px;padding:24px 16px}.content{grid-template-columns:1fr;gap:18px}.glyph{width:42px;height:42px}.panel-head{font-size:10px}.foot{font-size:10px}}
+@media(prefers-reduced-motion:reduce){.terminal,.cursor{animation:none}}
+</style>
+</head>
+<body class="` + className + `">
+<main class="terminal" aria-labelledby="result-title">
+  <div class="chrome" aria-hidden="true"><i class="dot"></i><i class="dot"></i><i class="dot"></i><span class="chrome-title">gack — localhost</span><span class="secure">LOCAL CALLBACK</span></div>
+  <header class="appbar"><span>GACK / SLACK AUTH</span><small>SECURE HANDOFF</small></header>
+  <nav class="breadcrumb" aria-label="Sign-in progress">YOU ARE HERE <b>›</b> SIGN IN <b>›</b> <strong>` + location + `</strong></nav>
+  <section class="stage">
+    <div class="panel" role="status" aria-live="polite">
+      <div class="panel-head"><span>` + panelTitle + `</span><span class="badge">` + badge + `</span></div>
+      <div class="content">
+        <div class="glyph" aria-hidden="true">` + glyph + `</div>
+        <div>
+          <h1 id="result-title">` + html.EscapeString(title) + `</h1>
+          <p>` + html.EscapeString(message) + `</p>
+          <div class="prompt" aria-hidden="true">` + prompt + `<i class="cursor"></i></div>
+        </div>
+      </div>
+      <div class="foot"><span>●</span> ` + closingNote + `</div>
+    </div>
+  </section>
+</main>
+</body>
+</html>`
 }
 
 func firstNonEmpty(values ...string) string {
