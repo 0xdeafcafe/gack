@@ -28,6 +28,7 @@ var (
 	footerStyle    = lipgloss.NewStyle().Foreground(muted)
 	activeBorder   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(purple)
 	inactiveBorder = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(muted)
+	floatingBorder = lipgloss.NewStyle().Border(lipgloss.DoubleBorder()).BorderForeground(purple)
 	selectedStyle  = lipgloss.NewStyle().Foreground(purple).Bold(true)
 	dimStyle       = lipgloss.NewStyle().Foreground(muted)
 	errorStyle     = lipgloss.NewStyle().Foreground(danger).Bold(true)
@@ -44,13 +45,14 @@ func (m *Model) View() string {
 		return "Starting gack…"
 	}
 	header := m.renderHeader()
-	bodyHeight := max(3, m.height-2)
+	footer := m.renderFooter()
+	bodyHeight := max(3, m.height-lipgloss.Height(header)-lipgloss.Height(footer))
 	var body string
 	switch {
 	case m.dialog != nil:
 		body = m.renderDialog(bodyHeight)
 	case m.overlay == overlayGlobalSearch:
-		body = m.renderSearch(bodyHeight)
+		body = m.renderSearch(m.renderBody(bodyHeight), bodyHeight)
 	case m.overlay == overlayAction || m.overlay == overlayReaction:
 		body = m.renderPicker(bodyHeight)
 	case m.overlay == overlayHelp:
@@ -58,7 +60,6 @@ func (m *Model) View() string {
 	default:
 		body = m.renderBody(bodyHeight)
 	}
-	footer := m.renderFooter()
 	return header + "\n" + body + "\n" + footer
 }
 
@@ -80,20 +81,31 @@ func (m *Model) renderHeader() string {
 	if m.snapshot.Team == "" {
 		left = "GACK"
 	}
-	right := location + "    Ctrl+K Search"
+	right := location + "  ›  " + m.focusPath() + "    Ctrl+K"
 	gap := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right)-2)
 	line := left + strings.Repeat(" ", gap) + right
 	return headerStyle.Width(max(0, m.width)).Render(truncate(line, max(1, m.width)))
 }
 
 func (m *Model) renderFooter() string {
+	if m.focus == focusComposer && m.overlay == overlayNone && m.dialog == nil {
+		return m.renderComposer()
+	}
 	var value string
 	style := footerStyle
 	switch {
+	case m.dialog != nil:
+		value = m.dialogFooter()
+	case m.overlay == overlayGlobalSearch:
+		value = "COMMAND PALETTE · type to filter · ↑/↓ choose · Enter open · Esc close"
+	case m.overlay == overlayAction:
+		value = "ACTION PICKER · ↑/↓ choose · Enter apply · Esc close"
+	case m.overlay == overlayReaction:
+		value = "REACTION PICKER · ↑/↓ choose · Enter toggle · Esc close"
+	case m.overlay == overlayHelp:
+		value = "HELP · ? or Esc closes"
 	case m.overlay == overlayFind:
-		value = m.findInput.View() + "  Enter next · Ctrl+P previous · Esc close"
-	case m.focus == focusComposer:
-		value = m.composeInput.View() + "  Enter send · Esc cancel"
+		value = "FIND · " + m.findInput.View() + "  Enter next · Ctrl+P previous · Esc close"
 	case m.err != "":
 		value = "Error: " + m.err
 		style = errorStyle
@@ -103,9 +115,31 @@ func (m *Model) renderFooter() string {
 		value = m.status
 		style = successStyle
 	default:
-		value = "j/k move · Enter thread · c compose · r react · i interact · R refresh · ? help · q quit"
+		value = m.contextualHelp()
 	}
 	return style.Width(max(0, m.width)).Render(truncate(value, max(1, m.width)))
+}
+
+func (m *Model) renderComposer() string {
+	context := "NEW MESSAGE"
+	if m.composeEditTS != "" {
+		context = "EDITING MESSAGE"
+	} else if m.composeThread != "" {
+		context = "REPLYING IN THREAD"
+	}
+	left := selectedStyle.Render("● COMPOSER") + dimStyle.Render(" · "+context)
+	right := dimStyle.Render("Ctrl+S send · Enter newline · Esc cancel")
+	heading := joinAcross(left, right, max(1, m.width))
+	editor := lipgloss.NewStyle().
+		PaddingLeft(2).
+		Width(max(1, m.width-2)).
+		Render(m.composeInput.View())
+	content := heading + "\n" + editor
+	return lipgloss.NewStyle().
+		Border(lipgloss.ThickBorder(), true, false, false, false).
+		BorderForeground(purple).
+		Width(max(1, m.width)).
+		Render(content)
 }
 
 func (m *Model) renderBody(height int) string {
@@ -164,6 +198,7 @@ func (m *Model) renderSidebar(width, height int) string {
 		}
 	}
 	lines = append(lines,
+		paneHeading("Sidebar", m.focus == focusSidebar, innerWidth),
 		m.sidebarLine("● Notifications", unreadActivity, m.sidebarAt == 0 && m.focus == focusSidebar, innerWidth),
 		m.sidebarLine("◷ Activity", len(m.activity), m.sidebarAt == 1 && m.focus == focusSidebar, innerWidth),
 		"",
@@ -179,9 +214,10 @@ func (m *Model) renderSidebar(width, height int) string {
 		start = max(0, len(m.channels)-available)
 	}
 	m.visibleChannelStart = start
-	// Global terminal row: one header row, one pane border row, four sidebar
-	// rows above the first channel.
-	m.channelRowStart = 1 + 1 + 4
+	// Global terminal row: the app header, pane border, then the sidebar rows
+	// above the first channel. Keep this derived from the rendered structure so
+	// mouse dragging stays correct as the navigation chrome evolves.
+	m.channelRowStart = 1 + 1 + len(lines)
 	for index := start; index < len(m.channels) && len(lines) < innerHeight; index++ {
 		channel := m.channels[index]
 		label := channel.Label()
@@ -231,7 +267,7 @@ func (m *Model) renderConversation(width, height int) string {
 	if len(m.messages) == 0 && m.busy == "" {
 		content = dimStyle.Render("No messages in this conversation.")
 	}
-	return m.renderPane(title, content, width, height, m.focus == focusMessages || (m.focus == focusComposer && m.composeThread == ""))
+	return m.renderPane(title, content, width, height, m.focus == focusMessages)
 }
 
 func (m *Model) renderThread(width, height int) string {
@@ -243,7 +279,7 @@ func (m *Model) renderThread(width, height int) string {
 	if len(m.thread) == 0 {
 		content = dimStyle.Render("Loading thread…")
 	}
-	return m.renderPane(title, content, width, height, m.focus == focusThread || (m.focus == focusComposer && m.composeThread != ""))
+	return m.renderPane(title, content, width, height, m.focus == focusThread)
 }
 
 func (m *Model) renderActivity(width, height int) string {
@@ -286,7 +322,7 @@ func (m *Model) renderPane(title, content string, width, height int, active bool
 		return ""
 	}
 	innerWidth, innerHeight := width-2, height-2
-	titleLine := lipgloss.NewStyle().Bold(true).Render(truncate(title, innerWidth))
+	titleLine := paneHeading(title, active, innerWidth)
 	contentHeight := max(0, innerHeight-1)
 	content = cropLines(content, contentHeight, innerWidth)
 	if contentHeight > 0 {
@@ -438,10 +474,21 @@ func (m *Model) renderMessage(message gack.Message, width int, selected bool, in
 	return strings.Join(lines, "\n")
 }
 
-func (m *Model) renderSearch(height int) string {
+func (m *Model) renderSearch(background string, height int) string {
 	width := min(max(34, m.width-8), 82)
 	inner := max(1, width-4)
-	lines := []string{lipgloss.NewStyle().Bold(true).Render("Jump to…"), "", m.searchInput.View(), ""}
+	resultCount := m.searchItemCount()
+	position := "TYPE TO FILTER"
+	if resultCount > 0 {
+		position = fmt.Sprintf("ITEM %d OF %d", min(m.searchAt+1, resultCount), resultCount)
+	}
+	lines := []string{
+		joinAcross(selectedStyle.Render("COMMAND PALETTE"), dimStyle.Render(position), inner),
+		dimStyle.Render("Jump to a channel or search every message"),
+		"",
+		m.searchInput.View(),
+		"",
+	}
 	if m.busy == "Searching…" {
 		lines = append(lines, dimStyle.Render("Searching messages…"))
 	} else if m.searchRan {
@@ -466,10 +513,10 @@ func (m *Model) renderSearch(height int) string {
 			lines = append(lines, chooserLine(label, m.searchAt == len(channels), inner))
 		}
 	}
-	lines = append(lines, "", dimStyle.Render("↑/↓ choose · Enter open/search · Esc close"))
+	lines = append(lines, "", dimStyle.Render("↑/↓ choose · Enter open/search · Esc close · Ctrl+K toggle"))
 	boxHeight := min(height-2, max(10, len(lines)+2))
-	box := activeBorder.Width(width - 2).Height(boxHeight - 2).Render(cropLines(strings.Join(lines, "\n"), boxHeight-2, width-4))
-	return lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, box)
+	box := floatingBorder.Width(width - 2).Height(boxHeight - 2).Render(cropLines(strings.Join(lines, "\n"), boxHeight-2, width-4))
+	return floatingOverlay(background, withShadow(box), m.width, height)
 }
 
 func (m *Model) renderPicker(height int) string {
@@ -479,7 +526,11 @@ func (m *Model) renderPicker(height int) string {
 	}
 	width := min(54, max(30, m.width-8))
 	inner := width - 4
-	lines := []string{lipgloss.NewStyle().Bold(true).Render(title), ""}
+	position := "NO OPTIONS"
+	if len(m.pickerOptions) > 0 {
+		position = fmt.Sprintf("OPTION %d OF %d", min(m.pickerAt+1, len(m.pickerOptions)), len(m.pickerOptions))
+	}
+	lines := []string{joinAcross(selectedStyle.Render(title), dimStyle.Render(position), inner), ""}
 	for index, option := range m.pickerOptions {
 		lines = append(lines, chooserLine(option.label, index == m.pickerAt, inner))
 	}
@@ -493,7 +544,15 @@ func (m *Model) renderDialog(height int) string {
 	dialog := m.dialog
 	width := min(76, max(36, m.width-6))
 	inner := width - 4
-	lines := []string{lipgloss.NewStyle().Bold(true).Foreground(purple).Render(dialog.view.Title), ""}
+	fieldAt, fieldCount := dialogFieldPosition(dialog)
+	position := "NO FIELDS"
+	if fieldCount > 0 {
+		position = fmt.Sprintf("FIELD %d OF %d", fieldAt, fieldCount)
+	}
+	lines := []string{
+		joinAcross(selectedStyle.Render("DIALOG · "+dialog.view.Title), dimStyle.Render(position), inner),
+		"",
+	}
 	for _, block := range dialog.view.Blocks {
 		if block.Type == "section" && block.Text != "" {
 			lines = append(lines, wrapText(formatSlackText(block.Text, m.snapshot.Users, m.channels), inner)...)
@@ -515,6 +574,9 @@ func (m *Model) renderDialog(height int) string {
 		}
 		if field.block.Optional {
 			label += dimStyle.Render(" (optional)")
+		}
+		if index == dialog.at {
+			label += selectedStyle.Render("  ← FOCUSED")
 		}
 		lines = append(lines, marker+label)
 		switch {
@@ -568,22 +630,242 @@ func (m *Model) renderHelp(height int) string {
 	width := min(74, max(36, m.width-6))
 	lines := []string{
 		lipgloss.NewStyle().Bold(true).Foreground(purple).Render("Keyboard & mouse"), "",
-		"Ctrl+K       Jump to a channel or search all messages",
+		"Ctrl+K       Open the floating command palette",
 		"Ctrl+F       Find text in the current conversation/thread",
 		"j / k        Move down / up", "g / G        First / last message",
 		"Enter / t    Open a thread", "c            Compose or reply",
+		"e / Ctrl+Up   Edit selected / latest own message", "y            Copy selected message",
 		"r            Add/remove emoji reaction", "i or 1–9     Use Block Kit actions",
 		"a / n        Activity / unread notifications", "Tab          Move between panes",
 		"R            Refresh the current view",
 		"Shift+J/K    Reorder the selected channel", "Mouse drag   Reorder channels; wheel scrolls messages",
 		"Esc          Go back", "q            Quit", "",
-		dimStyle.Render("Terminal protocols generally do not transmit the macOS Command key."),
-		dimStyle.Render("Map Cmd+K to Ctrl+K in your terminal if you want the native chord."), "",
+		dimStyle.Render("Want Cmd+K? Map it to Ctrl+K in your terminal profile."),
+		dimStyle.Render("Most terminal protocols do not send the macOS Command modifier to apps."), "",
 		dimStyle.Render("Press ? or Esc to close"),
 	}
 	boxHeight := min(height-2, len(lines)+2)
 	box := activeBorder.Width(width - 2).Height(boxHeight - 2).Render(cropLines(strings.Join(lines, "\n"), boxHeight-2, width-4))
 	return lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, box)
+}
+
+func (m *Model) focusPath() string {
+	if !m.ready {
+		return "Connecting"
+	}
+	if m.dialog != nil {
+		label := "Dialog"
+		if m.dialog.at >= 0 && m.dialog.at < len(m.dialog.fields) {
+			field := m.dialog.fields[m.dialog.at]
+			label = firstNonEmpty(field.block.Label, field.element.Text, field.element.Placeholder, field.element.ActionID, "Dialog")
+		}
+		at, count := dialogFieldPosition(m.dialog)
+		if count > 0 {
+			return fmt.Sprintf("Dialog › %s (%d/%d)", oneLine(label), at, count)
+		}
+		return "Dialog"
+	}
+	switch m.overlay {
+	case overlayGlobalSearch:
+		count := m.searchItemCount()
+		if count > 0 {
+			return fmt.Sprintf("Command palette › item %d/%d", min(m.searchAt+1, count), count)
+		}
+		return "Command palette › search"
+	case overlayFind:
+		return "Find in " + m.focusedPaneName()
+	case overlayAction:
+		return pickerPath("Action picker", m.pickerAt, len(m.pickerOptions))
+	case overlayReaction:
+		return pickerPath("Reaction picker", m.pickerAt, len(m.pickerOptions))
+	case overlayHelp:
+		return "Help"
+	}
+	if m.focus == focusSidebar {
+		return "Sidebar › " + m.sidebarFocusLabel()
+	}
+	if m.focus == focusComposer {
+		context := "Composer"
+		if m.composeEditTS != "" {
+			context = "Editing message"
+		} else if m.composeThread != "" {
+			context = "Thread › Composer"
+		}
+		return context
+	}
+	if m.mode == viewActivity || m.mode == viewNotifications {
+		items := m.filteredActivity()
+		return itemPath(m.focusedPaneName(), m.activityAt, len(items), "item")
+	}
+	if m.focus == focusThread {
+		return itemPath("Thread", m.threadAt, len(m.thread), "reply")
+	}
+	return itemPath("Conversation", m.message, len(m.messages), "message")
+}
+
+func (m *Model) focusedPaneName() string {
+	if m.focus == focusThread {
+		return "thread"
+	}
+	if m.mode == viewNotifications {
+		return "notifications"
+	}
+	if m.mode == viewActivity {
+		return "activity"
+	}
+	return "conversation"
+}
+
+func (m *Model) sidebarFocusLabel() string {
+	selected := m.sidebarSelection()
+	switch selected {
+	case 0:
+		return "Notifications"
+	case 1:
+		return "Activity"
+	default:
+		index := selected - 2
+		if index >= 0 && index < len(m.channels) {
+			return m.channels[index].Label()
+		}
+	}
+	return "Navigation"
+}
+
+func (m *Model) contextualHelp() string {
+	switch {
+	case m.focus == focusSidebar:
+		return "SIDEBAR · j/k choose · Enter open · Shift+J/K reorder · Tab next pane · Ctrl+K palette"
+	case m.mode == viewActivity || m.mode == viewNotifications:
+		return strings.ToUpper(m.focusedPaneName()) + " · j/k choose · Enter open · h sidebar · Tab next pane"
+	case m.focus == focusThread:
+		return "THREAD · j/k move · c reply · r react · i interact · h conversation · Tab next pane"
+	default:
+		return "CONVERSATION · j/k move · Enter thread · c compose · r react · i interact · Tab next pane"
+	}
+}
+
+func (m *Model) dialogFooter() string {
+	label := "No interactive fields"
+	hint := "Ctrl+S submit · Esc cancel"
+	if m.dialog != nil && m.dialog.at >= 0 && m.dialog.at < len(m.dialog.fields) {
+		field := m.dialog.fields[m.dialog.at]
+		label = firstNonEmpty(field.block.Label, field.element.Text, field.element.Placeholder, field.element.ActionID, "Field")
+		switch {
+		case isTextField(field.element.Type):
+			hint = "type · Tab next field · Ctrl+S submit · Esc cancel"
+		case field.element.Type == "checkboxes" || strings.Contains(field.element.Type, "multi_"):
+			hint = "arrows choose · Space toggle · Tab next field · Ctrl+S submit"
+		case len(field.element.Options) > 0:
+			hint = "←/→ choose · Tab next field · Ctrl+S submit · Esc cancel"
+		case field.element.Type == "button":
+			hint = "Enter press · Tab next field · Ctrl+S submit · Esc cancel"
+		}
+	}
+	return "DIALOG · " + oneLine(label) + " · " + hint
+}
+
+func itemPath(pane string, at, count int, noun string) string {
+	if count <= 0 {
+		return pane
+	}
+	at = max(0, min(count-1, at))
+	return fmt.Sprintf("%s › %s %d/%d", pane, noun, at+1, count)
+}
+
+func pickerPath(picker string, at, count int) string {
+	if count <= 0 {
+		return picker
+	}
+	return fmt.Sprintf("%s › option %d/%d", picker, min(at+1, count), count)
+}
+
+func dialogFieldPosition(dialog *dialogState) (int, int) {
+	if dialog == nil {
+		return 0, 0
+	}
+	position, count := 0, 0
+	for index := range dialog.fields {
+		if !dialog.fields[index].visible {
+			continue
+		}
+		count++
+		if index == dialog.at {
+			position = count
+		}
+	}
+	return position, count
+}
+
+func paneHeading(title string, active bool, width int) string {
+	marker := dimStyle.Render("○")
+	label := lipgloss.NewStyle().Bold(true).Render(title)
+	right := ""
+	if active {
+		marker = selectedStyle.Render("●")
+		right = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF")).Background(purple).Render(" FOCUS ")
+	}
+	return joinAcross(marker+" "+label, right, width)
+}
+
+func joinAcross(left, right string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if right == "" {
+		return truncateANSI(left, width)
+	}
+	right = truncateANSI(right, width)
+	available := width - lipgloss.Width(right) - 1
+	if available <= 0 {
+		return truncateANSI(left, width)
+	}
+	left = truncateANSI(left, available)
+	gap := max(1, width-lipgloss.Width(left)-lipgloss.Width(right))
+	return left + strings.Repeat(" ", gap) + right
+}
+
+func withShadow(box string) string {
+	boxWidth := lipgloss.Width(box)
+	lines := strings.Split(box, "\n")
+	for index := range lines {
+		lines[index] = padRight(lines[index], boxWidth) + dimStyle.Render("░░")
+	}
+	lines = append(lines, dimStyle.Render("  "+strings.Repeat("░", boxWidth)))
+	return strings.Join(lines, "\n")
+}
+
+// floatingOverlay composites a modal above a dimmed copy of the current body.
+// Keeping the panes visible around it makes the palette feel spatially anchored
+// instead of looking like navigation replaced the entire screen.
+func floatingOverlay(background, foreground string, width, height int) string {
+	background = cropLines(background, height, width)
+	foregroundLines := strings.Split(foreground, "\n")
+	foregroundWidth := min(width, lipgloss.Width(foreground))
+	foregroundHeight := min(height, len(foregroundLines))
+	x := max(0, (width-foregroundWidth)/2)
+	y := max(0, (height-foregroundHeight)/3)
+
+	backgroundLines := strings.Split(background, "\n")
+	for row := range backgroundLines {
+		plain := ansi.Strip(backgroundLines[row])
+		plain = padRight(truncateANSI(plain, width), width)
+		if row < y || row >= y+foregroundHeight {
+			backgroundLines[row] = dimStyle.Render(plain)
+			continue
+		}
+		foregroundLine := truncateANSI(foregroundLines[row-y], foregroundWidth)
+		foregroundLine = padRight(foregroundLine, foregroundWidth)
+		left := padRight(ansi.Cut(plain, 0, x), x)
+		rightWidth := max(0, width-x-foregroundWidth)
+		right := padRight(ansi.Cut(plain, x+foregroundWidth, width), rightWidth)
+		backgroundLines[row] = dimStyle.Render(left) + foregroundLine + dimStyle.Render(right)
+	}
+	return strings.Join(backgroundLines, "\n")
+}
+
+func padRight(value string, width int) string {
+	return value + strings.Repeat(" ", max(0, width-lipgloss.Width(value)))
 }
 
 func chooserLine(label string, selected bool, width int) string {

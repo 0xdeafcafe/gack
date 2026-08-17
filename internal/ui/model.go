@@ -8,6 +8,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atotto/clipboard"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -81,8 +83,10 @@ type Model struct {
 	searchAt      int
 	searchRan     bool
 	findInput     textinput.Model
-	composeInput  textinput.Model
+	composeInput  textarea.Model
 	composeThread string
+	composeEditTS string
+	composeOrigin focus
 	overlay       overlayMode
 
 	pickerElement *struct {
@@ -109,9 +113,15 @@ func New(backend gack.Backend, order []string, saveOrder func([]string) error) *
 	find := textinput.New()
 	find.Prompt = "Find › "
 	find.Placeholder = "text in this conversation"
-	compose := textinput.New()
-	compose.Prompt = "Message › "
+	compose := textarea.New()
+	compose.Prompt = ""
 	compose.Placeholder = "Write a message"
+	compose.ShowLineNumbers = false
+	compose.EndOfBufferCharacter = ' '
+	compose.CharLimit = 40_000
+	compose.MaxHeight = 8
+	compose.SetHeight(4)
+	compose.SetWidth(72)
 	return &Model{
 		backend: backend, saveOrder: saveOrder, order: append([]string(nil), order...),
 		channel: -1, message: -1, threadAt: -1, activityAt: 0,
@@ -150,6 +160,13 @@ type postResult struct {
 	err     error
 }
 
+type editResult struct {
+	channel string
+	ts      string
+	message gack.Message
+	err     error
+}
+
 type searchResult struct {
 	results []gack.SearchResult
 	err     error
@@ -175,6 +192,7 @@ type reactionResult struct {
 }
 
 type orderSaved struct{ err error }
+type copiedResult struct{ err error }
 
 func bootstrapCmd(backend gack.Backend) tea.Cmd {
 	return func() tea.Msg {
@@ -210,6 +228,19 @@ func postCmd(backend gack.Backend, channel, thread, text string) tea.Cmd {
 		message, err := backend.PostMessage(ctx, channel, thread, text)
 		return postResult{channel: channel, thread: thread, message: message, err: err}
 	}
+}
+
+func editCmd(backend gack.Backend, channel, ts, text string) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		message, err := backend.EditMessage(ctx, channel, ts, text)
+		return editResult{channel: channel, ts: ts, message: message, err: err}
+	}
+}
+
+func copyCmd(value string) tea.Cmd {
+	return func() tea.Msg { return copiedResult{err: clipboard.WriteAll(value)} }
 }
 
 func searchCmd(backend gack.Backend, query string) tea.Cmd {
@@ -264,7 +295,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		inputWidth := max(20, min(72, m.width-12))
 		m.searchInput.Width = inputWidth
 		m.findInput.Width = inputWidth
-		m.composeInput.Width = max(12, m.width-36)
+		m.composeInput.SetWidth(max(20, m.width-4))
+		m.composeInput.SetHeight(min(6, max(3, m.height/5)))
 		m.resizeDialogInputs()
 		return m, nil
 	case bootstrapResult:
@@ -328,6 +360,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.messages = appendBounded(m.messages, msg.message, 100)
 				m.message = len(m.messages) - 1
 			}
+		}
+		return m, nil
+	case editResult:
+		m.busy = ""
+		if msg.err != nil {
+			m.err = msg.err.Error()
+			return m, nil
+		}
+		m.err = ""
+		m.status = "Message updated"
+		if msg.channel == m.currentChannelID() {
+			m.replaceMessage(msg.ts, msg.message)
 		}
 		return m, nil
 	case searchResult:
@@ -394,6 +438,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "Channel order saved"
 		}
 		return m, nil
+	case copiedResult:
+		if msg.err != nil {
+			m.err = "Could not copy message: " + msg.err.Error()
+		} else {
+			m.status = "Message copied"
+		}
+		return m, nil
 	case tea.MouseMsg:
 		return m.updateMouse(msg)
 	case tea.KeyMsg:
@@ -423,13 +474,16 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
+	// Keep the command palette global, including while a draft is open. This is
+	// also the byte terminals can map a physical Cmd+K chord to.
+	if key == "ctrl+k" {
+		m.openSearch()
+		return m, nil
+	}
 	if m.focus == focusComposer {
 		return m, m.updateComposer(msg)
 	}
 	switch key {
-	case "ctrl+k":
-		m.openSearch()
-		return m, nil
 	case "ctrl+f":
 		if m.mode == viewConversation {
 			m.overlay = overlayFind
@@ -462,6 +516,11 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.openActivity(false)
 	case "n":
 		return m, m.openActivity(true)
+	case "ctrl+up":
+		if m.mode == viewConversation {
+			return m, m.editLatestOwnMessage()
+		}
+		return m, nil
 	case "esc":
 		if m.threadTS != "" {
 			m.threadTS, m.thread = "", nil
@@ -550,6 +609,10 @@ func (m *Model) updateConversation(key string) tea.Cmd {
 		m.openComposer(thread)
 	case "r":
 		m.openReactionPicker(messages[selected])
+	case "y":
+		return copyCmd(messages[selected].Text)
+	case "e":
+		return m.openMessageEditor(messages[selected])
 	case "i":
 		return m.openActionPicker(messages[selected])
 	default:
@@ -588,27 +651,29 @@ func (m *Model) updateComposer(msg tea.KeyMsg) tea.Cmd {
 	switch msg.String() {
 	case "esc":
 		m.composeInput.Blur()
-		m.composeInput.SetValue("")
-		if m.composeThread != "" {
-			m.focus = focusThread
-		} else {
-			m.focus = focusMessages
-		}
+		m.composeInput.Reset()
+		m.composeEditTS = ""
+		m.focus = m.composeOrigin
 		return nil
-	case "enter":
+	case "ctrl+up":
+		if strings.TrimSpace(m.composeInput.Value()) == "" && m.composeEditTS == "" {
+			return m.editLatestOwnMessage()
+		}
+	case "ctrl+s", "alt+enter", "ctrl+enter":
 		text := strings.TrimSpace(m.composeInput.Value())
 		if text == "" {
 			return nil
 		}
-		channel, thread := m.currentChannelID(), m.composeThread
-		m.composeInput.SetValue("")
+		channel, thread, editTS := m.currentChannelID(), m.composeThread, m.composeEditTS
+		m.composeInput.Reset()
 		m.composeInput.Blur()
-		if thread != "" {
-			m.focus = focusThread
-		} else {
-			m.focus = focusMessages
+		m.composeEditTS = ""
+		m.focus = m.composeOrigin
+		if editTS != "" {
+			m.busy = "Updating message…"
+			return editCmd(m.backend, channel, editTS, text)
 		}
-		m.busy = "Sending…"
+		m.busy = "Sending message…"
 		return postCmd(m.backend, channel, thread, text)
 	}
 	var cmd tea.Cmd
@@ -755,16 +820,57 @@ func (m *Model) openActivity(notificationsOnly bool) tea.Cmd {
 }
 
 func (m *Model) openComposer(thread string) {
+	m.composeOrigin = m.focus
 	m.composeThread = thread
+	m.composeEditTS = ""
 	m.focus = focusComposer
 	m.composeInput.Placeholder = "Write a message"
 	if thread != "" {
 		m.composeInput.Placeholder = "Reply in thread"
 	}
+	m.composeInput.Reset()
 	m.composeInput.Focus()
 }
 
+func (m *Model) openMessageEditor(message gack.Message) tea.Cmd {
+	if message.TS == "" {
+		return nil
+	}
+	if message.UserID != m.snapshot.Self.ID {
+		m.status = "You can only edit your own messages"
+		return nil
+	}
+	if m.focus != focusComposer {
+		m.composeOrigin = m.focus
+	}
+	m.composeThread = message.ThreadTS
+	m.composeEditTS = message.TS
+	m.composeInput.SetValue(message.Text)
+	m.composeInput.CursorEnd()
+	m.composeInput.Placeholder = "Edit message"
+	m.composeInput.Focus()
+	m.focus = focusComposer
+	return nil
+}
+
+func (m *Model) editLatestOwnMessage() tea.Cmd {
+	messages := m.messages
+	if m.focus == focusThread || (m.focus == focusComposer && m.composeThread != "") {
+		messages = m.thread
+	}
+	for index := len(messages) - 1; index >= 0; index-- {
+		if messages[index].UserID == m.snapshot.Self.ID {
+			return m.openMessageEditor(messages[index])
+		}
+	}
+	m.status = "No message of yours to edit here"
+	return nil
+}
+
 func (m *Model) openSearch() {
+	if m.focus == focusComposer {
+		m.composeInput.Blur()
+	}
 	m.overlay = overlayGlobalSearch
 	m.searchInput.SetValue("")
 	m.searchInput.Focus()
@@ -776,6 +882,9 @@ func (m *Model) openSearch() {
 func (m *Model) closeSearch() {
 	m.overlay = overlayNone
 	m.searchInput.Blur()
+	if m.focus == focusComposer {
+		m.composeInput.Focus()
+	}
 	m.searchResults = nil
 	m.searchRan = false
 }
@@ -1077,6 +1186,45 @@ func (m *Model) applyReaction(result reactionResult) {
 			if !result.remove {
 				messages[i].Reactions = append(messages[i].Reactions, gack.Reaction{Name: result.emoji, Count: 1, Mine: true})
 			}
+		}
+	}
+	update(m.messages)
+	update(m.thread)
+}
+
+func (m *Model) replaceMessage(ts string, replacement gack.Message) {
+	update := func(messages []gack.Message) {
+		for index := range messages {
+			if messages[index].TS != ts {
+				continue
+			}
+			original := messages[index]
+			if replacement.TS == "" {
+				replacement.TS = original.TS
+			}
+			if replacement.ChannelID == "" {
+				replacement.ChannelID = original.ChannelID
+			}
+			if replacement.UserID == "" {
+				replacement.UserID = original.UserID
+			}
+			if replacement.Username == "" {
+				replacement.Username = original.Username
+			}
+			if replacement.Time.IsZero() {
+				replacement.Time = original.Time
+			}
+			if replacement.ThreadTS == "" {
+				replacement.ThreadTS = original.ThreadTS
+			}
+			if replacement.ReplyCount == 0 {
+				replacement.ReplyCount = original.ReplyCount
+			}
+			if replacement.Reactions == nil {
+				replacement.Reactions = original.Reactions
+			}
+			replacement.Edited = true
+			messages[index] = replacement
 		}
 	}
 	update(m.messages)
