@@ -271,6 +271,12 @@ func runActivity(ctx context.Context, backend gack.Backend, args []string) (acti
 	if len(parsed.positionals) != 0 {
 		return activityData{}, usageError("activity does not accept positional arguments", "gack api activity [--unread]")
 	}
+	// Activity may derive mentions from the authenticated user's ID. Backends
+	// such as Slack populate that identity during bootstrap, so the standalone
+	// agent command must not depend on a prior command having run in-process.
+	if _, err := backend.Bootstrap(ctx); err != nil {
+		return activityData{}, fmt.Errorf("load workspace identity: %w", err)
+	}
 	activity, err := backend.Activity(ctx)
 	if err != nil {
 		return activityData{}, fmt.Errorf("load activity: %w", err)

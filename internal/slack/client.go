@@ -1,7 +1,6 @@
 package slack
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"github.com/0xdeafcafe/gack/internal/gack"
+	slackapi "github.com/slack-go/slack"
 )
 
 const defaultBaseURL = "https://slack.com/api/"
@@ -33,9 +33,10 @@ type Config struct {
 }
 
 type Client struct {
+	api          *slackapi.Client
 	token        string
 	baseURL      string
-	http         *http.Client
+	http         responseLimitClient
 	bridge       InteractionBridge
 	messageLimit int
 	channelLimit int
@@ -46,7 +47,8 @@ type Client struct {
 }
 
 func New(config Config) (*Client, error) {
-	if strings.TrimSpace(config.Token) == "" {
+	token := strings.TrimSpace(config.Token)
+	if token == "" {
 		return nil, errors.New("Slack token is empty")
 	}
 	if config.BaseURL == "" {
@@ -69,56 +71,48 @@ func New(config Config) (*Client, error) {
 	if config.ConversationLimit <= 0 {
 		config.ConversationLimit = 500
 	}
+
+	// One context-aware retry on 429 matches Gack's previous transport without
+	// retrying writes after ambiguous network failures. Typed SDK methods own the
+	// form/query encoding, which prevents required Slack fields from silently
+	// disappearing into an unsupported JSON body.
+	retry := slackapi.DefaultRetryConfig()
+	retry.MaxRetries = 1
+	retry.RetryAfterDuration = time.Second
+	retry.RetryAfterJitter = 0
+	retry.Handlers = slackapi.DefaultRetryHandlers(retry)
+	boundedHTTP := responseLimitClient{client: config.HTTPClient}
+	api := slackapi.New(
+		token,
+		slackapi.OptionHTTPClient(boundedHTTP),
+		slackapi.OptionAPIURL(config.BaseURL),
+		slackapi.OptionRetryConfig(retry),
+	)
+
 	return &Client{
-		token: config.Token, baseURL: config.BaseURL, http: config.HTTPClient,
+		api: api, token: token, baseURL: config.BaseURL, http: boundedHTTP,
 		bridge: config.Bridge, messageLimit: config.MessageLimit,
 		channelLimit: config.ConversationLimit, users: map[string]gack.User{},
 	}, nil
 }
 
-type authResponse struct {
-	UserID string `json:"user_id"`
-	User   string `json:"user"`
-	Team   string `json:"team"`
+// responseLimitClient preserves the old transport's response bound while the
+// official SDK handles request construction and response decoding. A malformed
+// proxy or endpoint therefore cannot make one API page grow without limit.
+type responseLimitClient struct {
+	client *http.Client
 }
 
-type usersResponse struct {
-	Members []struct {
-		ID      string `json:"id"`
-		Name    string `json:"name"`
-		Deleted bool   `json:"deleted"`
-		IsBot   bool   `json:"is_bot"`
-		Profile struct {
-			RealName    string `json:"real_name"`
-			DisplayName string `json:"display_name"`
-			StatusEmoji string `json:"status_emoji"`
-		} `json:"profile"`
-	} `json:"members"`
-	ResponseMetadata struct {
-		NextCursor string `json:"next_cursor"`
-	} `json:"response_metadata"`
-}
-
-type conversationsResponse struct {
-	Channels []struct {
-		ID                 string `json:"id"`
-		Name               string `json:"name"`
-		User               string `json:"user"`
-		IsIM               bool   `json:"is_im"`
-		IsMPIM             bool   `json:"is_mpim"`
-		IsPrivate          bool   `json:"is_private"`
-		IsMember           bool   `json:"is_member"`
-		IsArchived         bool   `json:"is_archived"`
-		IsStarred          bool   `json:"is_starred"`
-		UnreadCountDisplay int    `json:"unread_count_display"`
-		LastRead           string `json:"last_read"`
-		Topic              struct {
-			Value string `json:"value"`
-		} `json:"topic"`
-	} `json:"channels"`
-	ResponseMetadata struct {
-		NextCursor string `json:"next_cursor"`
-	} `json:"response_metadata"`
+func (c responseLimitClient) Do(request *http.Request) (*http.Response, error) {
+	response, err := c.client.Do(request)
+	if err != nil || response == nil || response.Body == nil {
+		return response, err
+	}
+	response.Body = struct {
+		io.Reader
+		io.Closer
+	}{Reader: io.LimitReader(response.Body, 8<<20), Closer: response.Body}
+	return response, nil
 }
 
 // BootstrapCore deliberately excludes users.list. Large workspaces can take
@@ -129,7 +123,7 @@ func (c *Client) BootstrapCore(ctx context.Context) (gack.Snapshot, error) {
 	defer cancel()
 
 	var (
-		auth     authResponse
+		auth     *slackapi.AuthTestResponse
 		channels []gack.Conversation
 		failure  struct {
 			stage string
@@ -150,7 +144,10 @@ func (c *Client) BootstrapCore(ctx context.Context) (gack.Snapshot, error) {
 	}
 
 	workers.Add(2)
-	go fetch("auth", func() error { return c.call(bootstrapCtx, "auth.test", nil, &auth) })
+	go fetch("auth", func() (err error) {
+		auth, err = c.api.AuthTestContext(bootstrapCtx)
+		return wrapAPIError("auth.test", err)
+	})
 	go fetch("conversations", func() error {
 		var err error
 		channels, err = c.loadConversations(bootstrapCtx)
@@ -195,7 +192,7 @@ func (c *Client) Bootstrap(ctx context.Context) (gack.Snapshot, error) {
 	defer cancel()
 
 	var (
-		auth     authResponse
+		auth     *slackapi.AuthTestResponse
 		users    map[string]gack.User
 		channels []gack.Conversation
 		failure  struct {
@@ -220,7 +217,10 @@ func (c *Client) Bootstrap(ctx context.Context) (gack.Snapshot, error) {
 	// the user map only after every request has completed, keeping startup to the
 	// duration of the slowest pagination stream instead of the sum of all three.
 	workers.Add(3)
-	go fetch("auth", func() error { return c.call(bootstrapCtx, "auth.test", nil, &auth) })
+	go fetch("auth", func() (err error) {
+		auth, err = c.api.AuthTestContext(bootstrapCtx)
+		return wrapAPIError("auth.test", err)
+	})
 	go fetch("users", func() error {
 		var err error
 		users, err = c.loadUsers(bootstrapCtx)
@@ -257,18 +257,18 @@ func (c *Client) Bootstrap(ctx context.Context) (gack.Snapshot, error) {
 }
 
 func (c *Client) loadUsers(ctx context.Context) (map[string]gack.User, error) {
-	users := map[string]gack.User{}
+	users := make(map[string]gack.User, min(c.channelLimit, 200))
 	cursor := ""
 	for len(users) < c.channelLimit {
-		var response usersResponse
-		params := map[string]any{"limit": min(200, c.channelLimit-len(users))}
-		if cursor != "" {
-			params["cursor"] = cursor
+		page := c.api.GetUsersPaginated(
+			slackapi.GetUsersOptionLimit(min(200, c.channelLimit-len(users))),
+			slackapi.GetUsersOptionCursor(cursor),
+		)
+		page, err := page.Next(ctx)
+		if err != nil {
+			return nil, wrapAPIError("users.list", err)
 		}
-		if err := c.call(ctx, "users.list", params, &response); err != nil {
-			return nil, err
-		}
-		for _, source := range response.Members {
+		for _, source := range page.Users {
 			// Deleted accounts still own historical messages. Keep their profile
 			// metadata so old conversations do not degrade to "unknown".
 			realName := source.Profile.DisplayName
@@ -276,8 +276,11 @@ func (c *Client) loadUsers(ctx context.Context) (map[string]gack.User, error) {
 				realName = source.Profile.RealName
 			}
 			users[source.ID] = gack.User{ID: source.ID, Name: source.Name, RealName: realName, Emoji: source.Profile.StatusEmoji}
+			if len(users) == c.channelLimit {
+				break
+			}
 		}
-		cursor = strings.TrimSpace(response.ResponseMetadata.NextCursor)
+		cursor = strings.TrimSpace(page.Cursor)
 		if cursor == "" {
 			break
 		}
@@ -286,40 +289,29 @@ func (c *Client) loadUsers(ctx context.Context) (map[string]gack.User, error) {
 }
 
 func (c *Client) loadConversations(ctx context.Context) ([]gack.Conversation, error) {
-	var result []gack.Conversation
-	seen := make(map[string]struct{}, c.channelLimit)
+	result := make([]gack.Conversation, 0, min(c.channelLimit, 200))
+	seen := make(map[string]struct{}, min(c.channelLimit, 200))
 	cursor := ""
 	for len(result) < c.channelLimit {
-		var response conversationsResponse
-		params := map[string]any{
-			"types": "public_channel,private_channel,mpim,im", "exclude_archived": true,
-			"limit": min(200, c.channelLimit-len(result)),
-		}
-		if cursor != "" {
-			params["cursor"] = cursor
-		}
 		// users.conversations returns only conversations the authenticated user
-		// or bot belongs to. conversations.list returns every public channel in
-		// the workspace, which can require dozens of irrelevant pages in a large
-		// Slack and exhaust the whole bootstrap deadline.
-		if err := c.call(ctx, "users.conversations", params, &response); err != nil {
+		// belongs to. conversations.list can enumerate many irrelevant public
+		// channels and exhaust the whole bootstrap deadline.
+		channels, nextCursor, err := c.getConversationsForUser(ctx, cursor, min(200, c.channelLimit-len(result)))
+		if err != nil {
 			return nil, err
 		}
-		for _, source := range response.Channels {
+		for _, source := range channels {
 			if source.IsArchived {
 				continue
 			}
-			// A conversation can occasionally be repeated across cursor pages while
-			// membership is changing. Never turn that transport quirk into duplicate
-			// sidebar rows.
+			// Membership can change while paging. Do not turn a repeated API row
+			// into a duplicate sidebar entry.
 			if _, exists := seen[source.ID]; exists {
 				continue
 			}
 			seen[source.ID] = struct{}{}
 			name := source.Name
 			if source.IsIM && name == "" {
-				// Keep DMs distinguishable until the optional users.list hydration
-				// replaces this stable ID with the person's display name.
 				name = source.User
 			}
 			result = append(result, gack.Conversation{
@@ -329,13 +321,89 @@ func (c *Client) loadConversations(ctx context.Context) ([]gack.Conversation, er
 				IsMember: true, IsArchived: source.IsArchived,
 				IsFavorite: source.IsStarred, Unread: source.UnreadCountDisplay, LastRead: source.LastRead,
 			})
+			if len(result) == c.channelLimit {
+				break
+			}
 		}
-		cursor = strings.TrimSpace(response.ResponseMetadata.NextCursor)
+		cursor = strings.TrimSpace(nextCursor)
 		if cursor == "" {
 			break
 		}
 	}
 	return result, nil
+}
+
+// conversation is the official SDK model plus the one per-user field its
+// Channel type does not currently expose. Keeping this extension confined to
+// users.conversations preserves Slack favorites without reviving the generic
+// map/JSON transport that previously lost required fields.
+type conversation struct {
+	slackapi.Channel
+	IsStarred bool `json:"is_starred"`
+}
+
+type conversationsPage struct {
+	OK       bool           `json:"ok"`
+	Error    string         `json:"error"`
+	Channels []conversation `json:"channels"`
+	Metadata struct {
+		NextCursor string   `json:"next_cursor"`
+		Messages   []string `json:"messages"`
+	} `json:"response_metadata"`
+}
+
+func (c *Client) getConversationsForUser(ctx context.Context, cursor string, limit int) ([]conversation, string, error) {
+	values := url.Values{
+		"token":            {c.token},
+		"types":            {"public_channel,private_channel,mpim,im"},
+		"exclude_archived": {"true"},
+		"limit":            {strconv.Itoa(limit)},
+	}
+	if cursor != "" {
+		values.Set("cursor", cursor)
+	}
+	body := values.Encode()
+	for attempt := 0; attempt < 2; attempt++ {
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"users.conversations", strings.NewReader(body))
+		if err != nil {
+			return nil, "", err
+		}
+		request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		response, err := c.http.Do(request)
+		if err != nil {
+			return nil, "", fmt.Errorf("Slack users.conversations: %w", err)
+		}
+		if response.StatusCode == http.StatusTooManyRequests && attempt == 0 {
+			retryAfter, _ := strconv.Atoi(response.Header.Get("Retry-After"))
+			if retryAfter <= 0 {
+				retryAfter = 1
+			}
+			_ = response.Body.Close()
+			timer := time.NewTimer(time.Duration(retryAfter) * time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, "", ctx.Err()
+			case <-timer.C:
+				continue
+			}
+		}
+		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+			_ = response.Body.Close()
+			return nil, "", fmt.Errorf("Slack users.conversations: HTTP %s", response.Status)
+		}
+		var page conversationsPage
+		decodeErr := json.NewDecoder(response.Body).Decode(&page)
+		_ = response.Body.Close()
+		if decodeErr != nil {
+			return nil, "", fmt.Errorf("Slack users.conversations decode: %w", decodeErr)
+		}
+		if !page.OK {
+			return nil, "", &APIError{Method: "users.conversations", Code: page.Error, Details: page.Metadata.Messages}
+		}
+		return page.Channels, strings.TrimSpace(page.Metadata.NextCursor), nil
+	}
+	return nil, "", errors.New("Slack users.conversations: retry exhausted")
 }
 
 func resolveConversationUsers(conversations []gack.Conversation, users map[string]gack.User) {
@@ -353,55 +421,23 @@ func resolveConversationUsers(conversations []gack.Conversation, users map[strin
 	}
 }
 
-type slackReaction struct {
-	Name  string   `json:"name"`
-	Count int      `json:"count"`
-	Users []string `json:"users"`
-}
-
-type slackMessage struct {
-	Type       string          `json:"type"`
-	TS         string          `json:"ts"`
-	ThreadTS   string          `json:"thread_ts"`
-	User       string          `json:"user"`
-	Username   string          `json:"username"`
-	Text       string          `json:"text"`
-	ReplyCount int             `json:"reply_count"`
-	Blocks     json.RawMessage `json:"blocks"`
-	Reactions  []slackReaction `json:"reactions"`
-	Edited     *struct{}       `json:"edited"`
-	BotProfile *struct {
-		Name string `json:"name"`
-	} `json:"bot_profile"`
-}
-
-type messagesResponse struct {
-	Messages         []slackMessage `json:"messages"`
-	HasMore          bool           `json:"has_more"`
-	ResponseMetadata struct {
-		NextCursor string `json:"next_cursor"`
-	} `json:"response_metadata"`
-}
-
 func (c *Client) Messages(ctx context.Context, channel string) ([]gack.Message, error) {
 	page, err := c.MessagePage(ctx, channel, "")
 	return page.Messages, err
 }
 
 func (c *Client) MessagePage(ctx context.Context, channel, cursor string) (gack.HistoryPage, error) {
-	var response messagesResponse
-	params := map[string]any{"channel": channel, "limit": c.messageLimit, "include_all_metadata": true}
-	if cursor != "" {
-		params["cursor"] = cursor
-	}
-	if err := c.call(ctx, "conversations.history", params, &response); err != nil {
-		return gack.HistoryPage{}, err
+	response, err := c.api.GetConversationHistoryContext(ctx, &slackapi.GetConversationHistoryParameters{
+		ChannelID: channel, Cursor: cursor, Limit: c.messageLimit, IncludeAllMetadata: true,
+	})
+	if err != nil {
+		return gack.HistoryPage{}, wrapAPIError("conversations.history", err)
 	}
 	result := c.convertMessages(channel, response.Messages)
 	for left, right := 0, len(result)-1; left < right; left, right = left+1, right-1 {
 		result[left], result[right] = result[right], result[left]
 	}
-	return gack.HistoryPage{Messages: result, NextCursor: strings.TrimSpace(response.ResponseMetadata.NextCursor)}, nil
+	return gack.HistoryPage{Messages: result, NextCursor: strings.TrimSpace(response.ResponseMetaData.NextCursor)}, nil
 }
 
 func (c *Client) Thread(ctx context.Context, channel, thread string) ([]gack.Message, error) {
@@ -410,31 +446,32 @@ func (c *Client) Thread(ctx context.Context, channel, thread string) ([]gack.Mes
 }
 
 func (c *Client) ThreadPage(ctx context.Context, channel, thread, cursor string) (gack.HistoryPage, error) {
-	var response messagesResponse
-	params := map[string]any{"channel": channel, "ts": thread, "limit": c.messageLimit}
-	if cursor != "" {
-		params["cursor"] = cursor
-	}
-	// Unlike the other Web API methods used here, conversations.replies does
-	// not reliably consume a JSON POST body. Send its documented read
-	// arguments in the query string so Slack actually receives channel and ts.
-	if err := c.callQuery(ctx, "conversations.replies", params, &response); err != nil {
-		return gack.HistoryPage{}, err
+	messages, _, nextCursor, err := c.api.GetConversationRepliesContext(ctx, &slackapi.GetConversationRepliesParameters{
+		ChannelID: channel, Timestamp: thread, Cursor: cursor, Limit: c.messageLimit,
+	})
+	if err != nil {
+		return gack.HistoryPage{}, wrapAPIError("conversations.replies", err)
 	}
 	return gack.HistoryPage{
-		Messages:   c.convertMessages(channel, response.Messages),
-		NextCursor: strings.TrimSpace(response.ResponseMetadata.NextCursor),
+		Messages: c.convertMessages(channel, messages), NextCursor: strings.TrimSpace(nextCursor),
 	}, nil
 }
 
-func (c *Client) convertMessages(channel string, messages []slackMessage) []gack.Message {
+func (c *Client) convertMessages(channel string, messages []slackapi.Message) []gack.Message {
 	c.mu.RLock()
 	selfID := c.selfID
 	users := c.users
 	c.mu.RUnlock()
 	result := make([]gack.Message, 0, len(messages))
 	for _, source := range messages {
-		blocks, _ := gack.ParseBlocks(source.Blocks)
+		var blocks []gack.Block
+		if len(source.Blocks.BlockSet) > 0 {
+			// The SDK performs the polymorphic Block Kit decode. Gack then keeps
+			// only its compact, renderer-facing representation.
+			if raw, err := json.Marshal(source.Blocks); err == nil {
+				blocks, _ = gack.ParseBlocks(raw)
+			}
+		}
 		username := source.Username
 		if source.BotProfile != nil && source.BotProfile.Name != "" {
 			username = source.BotProfile.Name
@@ -445,8 +482,8 @@ func (c *Client) convertMessages(channel string, messages []slackMessage) []gack
 			}
 		}
 		message := gack.Message{
-			TS: source.TS, ThreadTS: source.ThreadTS, ChannelID: channel, UserID: source.User,
-			Username: username, Text: source.Text, Time: parseTimestamp(source.TS),
+			TS: source.Timestamp, ThreadTS: source.ThreadTimestamp, ChannelID: channel, UserID: source.User,
+			Username: username, Text: source.Text, Time: parseTimestamp(source.Timestamp),
 			Edited: source.Edited != nil, ReplyCount: source.ReplyCount, Blocks: blocks,
 		}
 		for _, reaction := range source.Reactions {
@@ -465,68 +502,62 @@ func (c *Client) convertMessages(channel string, messages []slackMessage) []gack
 }
 
 func (c *Client) PostMessage(ctx context.Context, channel, thread, text string) (gack.Message, error) {
-	params := map[string]any{"channel": channel, "text": text}
+	options := []slackapi.MsgOption{slackapi.MsgOptionText(text, false)}
 	if thread != "" {
-		params["thread_ts"] = thread
+		options = append(options, slackapi.MsgOptionTS(thread))
 	}
-	var response struct {
-		Channel string       `json:"channel"`
-		TS      string       `json:"ts"`
-		Message slackMessage `json:"message"`
+	responseChannel, timestamp, message, err := c.api.PostMessageWithResponseContext(ctx, channel, options...)
+	if err != nil {
+		return gack.Message{}, wrapAPIError("chat.postMessage", err)
 	}
-	if err := c.call(ctx, "chat.postMessage", params, &response); err != nil {
-		return gack.Message{}, err
+	if message.Timestamp == "" {
+		message.Timestamp = timestamp
 	}
-	converted := c.convertMessages(response.Channel, []slackMessage{response.Message})
+	if message.Text == "" {
+		message.Text = text
+	}
+	converted := c.convertMessages(responseChannel, []slackapi.Message{message})
 	if len(converted) == 0 {
-		return gack.Message{TS: response.TS, ChannelID: response.Channel, Text: text, Time: parseTimestamp(response.TS)}, nil
+		return gack.Message{TS: timestamp, ChannelID: responseChannel, Text: text, Time: parseTimestamp(timestamp)}, nil
 	}
 	return converted[0], nil
 }
 
 func (c *Client) EditMessage(ctx context.Context, channel, ts, text string) (gack.Message, error) {
-	var response struct {
-		Channel string       `json:"channel"`
-		TS      string       `json:"ts"`
-		Text    string       `json:"text"`
-		Message slackMessage `json:"message"`
+	responseChannel, timestamp, responseText, err := c.api.UpdateMessageContext(ctx, channel, ts, slackapi.MsgOptionText(text, false))
+	if err != nil {
+		return gack.Message{}, wrapAPIError("chat.update", err)
 	}
-	if err := c.call(ctx, "chat.update", map[string]any{"channel": channel, "ts": ts, "text": text}, &response); err != nil {
-		return gack.Message{}, err
+	if responseChannel == "" {
+		responseChannel = channel
 	}
-	if response.Message.TS == "" {
-		response.Message.TS = response.TS
+	if timestamp == "" {
+		timestamp = ts
 	}
-	if response.Message.Text == "" {
-		response.Message.Text = response.Text
+	if responseText == "" {
+		responseText = text
 	}
-	converted := c.convertMessages(response.Channel, []slackMessage{response.Message})
-	if len(converted) == 0 {
-		return gack.Message{TS: response.TS, ChannelID: channel, Text: text, Edited: true, Time: parseTimestamp(response.TS)}, nil
+	c.mu.RLock()
+	selfID := c.selfID
+	self := c.users[selfID]
+	c.mu.RUnlock()
+	username := ""
+	if self.ID != "" {
+		username = self.DisplayName()
 	}
-	converted[0].Edited = true
-	return converted[0], nil
+	return gack.Message{
+		TS: timestamp, ChannelID: responseChannel, UserID: selfID,
+		Username: username, Text: responseText, Edited: true, Time: parseTimestamp(timestamp),
+	}, nil
 }
 
 func (c *Client) ToggleReaction(ctx context.Context, channel, ts, emoji string, remove bool) error {
-	method := "reactions.add"
-	if remove {
-		method = "reactions.remove"
-	}
 	emoji = strings.Trim(strings.TrimSpace(emoji), ":")
-	return c.call(ctx, method, map[string]any{"channel": channel, "timestamp": ts, "name": emoji}, nil)
-}
-
-type searchResponse struct {
-	Messages struct {
-		Matches []struct {
-			slackMessage
-			Channel struct {
-				ID   string `json:"id"`
-				Name string `json:"name"`
-			} `json:"channel"`
-		} `json:"matches"`
-	} `json:"messages"`
+	item := slackapi.NewRefToMessage(channel, ts)
+	if remove {
+		return wrapAPIError("reactions.remove", c.api.RemoveReactionContext(ctx, emoji, item))
+	}
+	return wrapAPIError("reactions.add", c.api.AddReactionContext(ctx, emoji, item))
 }
 
 func (c *Client) Search(ctx context.Context, query string) ([]gack.SearchResult, error) {
@@ -534,18 +565,26 @@ func (c *Client) Search(ctx context.Context, query string) ([]gack.SearchResult,
 	if query == "" {
 		return nil, nil
 	}
-	var response searchResponse
-	if err := c.call(ctx, "search.messages", map[string]any{"query": query, "count": min(c.messageLimit, 100), "sort": "timestamp", "sort_dir": "desc"}, &response); err != nil {
-		return nil, err
+	parameters := slackapi.NewSearchParameters()
+	parameters.Count = min(c.messageLimit, 100)
+	parameters.Sort = "timestamp"
+	parameters.SortDirection = "desc"
+	matches, err := c.api.SearchMessagesContext(ctx, query, parameters)
+	if err != nil {
+		return nil, wrapAPIError("search.messages", err)
 	}
-	result := make([]gack.SearchResult, 0, len(response.Messages.Matches))
-	for _, match := range response.Messages.Matches {
-		messages := c.convertMessages(match.Channel.ID, []slackMessage{match.slackMessage})
-		if len(messages) == 0 {
+	result := make([]gack.SearchResult, 0, len(matches.Matches))
+	for _, match := range matches.Matches {
+		message := slackapi.Message{Msg: slackapi.Msg{
+			Type: match.Type, User: match.User, Username: match.Username,
+			Text: match.Text, Timestamp: match.Timestamp, Blocks: match.Blocks,
+		}}
+		converted := c.convertMessages(match.Channel.ID, []slackapi.Message{message})
+		if len(converted) == 0 {
 			continue
 		}
-		messages[0].ChannelName = match.Channel.Name
-		result = append(result, gack.SearchResult{ChannelID: match.Channel.ID, ChannelName: match.Channel.Name, Message: messages[0]})
+		converted[0].ChannelName = match.Channel.Name
+		result = append(result, gack.SearchResult{ChannelID: match.Channel.ID, ChannelName: match.Channel.Name, Message: converted[0]})
 	}
 	return result, nil
 }
@@ -585,16 +624,6 @@ func (c *Client) Interact(ctx context.Context, interaction gack.Interaction) (ga
 	return c.bridge.Interact(ctx, interaction)
 }
 
-type apiEnvelope struct {
-	OK               bool   `json:"ok"`
-	Error            string `json:"error"`
-	Warning          string `json:"warning"`
-	ResponseMetadata struct {
-		Messages []string `json:"messages"`
-	} `json:"response_metadata"`
-	Raw json.RawMessage `json:"-"`
-}
-
 type APIError struct {
 	Method  string
 	Code    string
@@ -609,85 +638,15 @@ func (e *APIError) Error() string {
 	return message
 }
 
-func (c *Client) call(ctx context.Context, method string, params map[string]any, output any) error {
-	return c.callWithTransport(ctx, http.MethodPost, method, params, output)
-}
-
-func (c *Client) callQuery(ctx context.Context, method string, params map[string]any, output any) error {
-	return c.callWithTransport(ctx, http.MethodGet, method, params, output)
-}
-
-func (c *Client) callWithTransport(ctx context.Context, httpMethod, method string, params map[string]any, output any) error {
-	if params == nil {
-		params = map[string]any{}
-	}
-	endpoint := c.baseURL + url.PathEscape(method)
-	var body []byte
-	if httpMethod == http.MethodGet {
-		query := url.Values{}
-		for key, value := range params {
-			query.Set(key, fmt.Sprint(value))
-		}
-		if encoded := query.Encode(); encoded != "" {
-			endpoint += "?" + encoded
-		}
-	} else {
-		var err error
-		body, err = json.Marshal(params)
-		if err != nil {
-			return err
-		}
-	}
-	for attempt := 0; attempt < 2; attempt++ {
-		request, err := http.NewRequestWithContext(ctx, httpMethod, endpoint, bytes.NewReader(body))
-		if err != nil {
-			return err
-		}
-		request.Header.Set("Authorization", "Bearer "+c.token)
-		if httpMethod != http.MethodGet {
-			request.Header.Set("Content-Type", "application/json; charset=utf-8")
-		}
-		response, err := c.http.Do(request)
-		if err != nil {
-			return fmt.Errorf("Slack %s: %w", method, err)
-		}
-		data, readErr := io.ReadAll(io.LimitReader(response.Body, 8<<20))
-		response.Body.Close()
-		if readErr != nil {
-			return fmt.Errorf("Slack %s response: %w", method, readErr)
-		}
-		if response.StatusCode == http.StatusTooManyRequests && attempt == 0 {
-			delay, _ := strconv.Atoi(response.Header.Get("Retry-After"))
-			if delay <= 0 {
-				delay = 1
-			}
-			timer := time.NewTimer(time.Duration(delay) * time.Second)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			case <-timer.C:
-				continue
-			}
-		}
-		if response.StatusCode < 200 || response.StatusCode >= 300 {
-			return fmt.Errorf("Slack %s: HTTP %s", method, response.Status)
-		}
-		var envelope apiEnvelope
-		if err := json.Unmarshal(data, &envelope); err != nil {
-			return fmt.Errorf("Slack %s decode: %w", method, err)
-		}
-		if !envelope.OK {
-			return &APIError{Method: method, Code: envelope.Error, Details: envelope.ResponseMetadata.Messages}
-		}
-		if output != nil {
-			if err := json.Unmarshal(data, output); err != nil {
-				return fmt.Errorf("Slack %s decode payload: %w", method, err)
-			}
-		}
+func wrapAPIError(method string, err error) error {
+	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("Slack %s: retry exhausted", method)
+	var response slackapi.SlackErrorResponse
+	if errors.As(err, &response) {
+		return &APIError{Method: method, Code: response.Err, Details: response.ResponseMetadata.Messages}
+	}
+	return fmt.Errorf("Slack %s: %w", method, err)
 }
 
 func parseTimestamp(value string) time.Time {

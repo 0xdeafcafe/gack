@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/0xdeafcafe/gack/internal/demo"
@@ -38,6 +39,23 @@ func runForTest(t *testing.T, backend gack.Backend, options Options, args ...str
 type snapshotBackend struct {
 	gack.Backend
 	snapshot gack.Snapshot
+}
+
+type activityBootstrapBackend struct {
+	gack.Backend
+	bootstrapped bool
+}
+
+func (b *activityBootstrapBackend) Bootstrap(ctx context.Context) (gack.Snapshot, error) {
+	b.bootstrapped = true
+	return b.Backend.Bootstrap(ctx)
+}
+
+func (b *activityBootstrapBackend) Activity(ctx context.Context) ([]gack.ActivityItem, error) {
+	if !b.bootstrapped {
+		return nil, errors.New("activity called before bootstrap")
+	}
+	return b.Backend.Activity(ctx)
 }
 
 func (b snapshotBackend) Bootstrap(context.Context) (gack.Snapshot, error) {
@@ -125,9 +143,13 @@ func TestReadCommandsUseNamesAndReturnStructuredData(t *testing.T) {
 	})
 
 	t.Run("activity", func(t *testing.T) {
-		status, response, _, _ := runForTest(t, backend, Options{}, "activity", "--unread")
+		activityBackend := &activityBootstrapBackend{Backend: backend}
+		status, response, _, _ := runForTest(t, activityBackend, Options{}, "activity", "--unread")
 		if status != ExitOK {
 			t.Fatalf("status=%d response=%#v", status, response)
+		}
+		if !activityBackend.bootstrapped {
+			t.Fatal("activity command did not bootstrap workspace identity")
 		}
 		var data activityData
 		if err := json.Unmarshal(response.Data, &data); err != nil {

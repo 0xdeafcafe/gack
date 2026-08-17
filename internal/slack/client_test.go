@@ -20,8 +20,11 @@ func TestClientBootstrapMessagesSearchAndReaction(t *testing.T) {
 	var mu sync.Mutex
 	called := map[string]int{}
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.Header.Get("Authorization") != "Bearer xoxp-test" {
-			t.Errorf("missing authorization header")
+		if err := request.ParseForm(); err != nil {
+			t.Errorf("parse Slack SDK request: %v", err)
+		}
+		if request.Form.Get("token") != "xoxp-test" {
+			t.Errorf("missing Slack SDK token")
 		}
 		method := strings.TrimPrefix(request.URL.Path, "/")
 		mu.Lock()
@@ -34,17 +37,35 @@ func TestClientBootstrapMessagesSearchAndReaction(t *testing.T) {
 		case "users.list":
 			writeJSON(writer, `{"ok":true,"members":[{"id":"U1","name":"alex","profile":{"display_name":"Alex"}},{"id":"U2","name":"maya","profile":{"real_name":"Maya"}}]}`)
 		case "users.conversations":
-			writeJSON(writer, `{"ok":true,"channels":[{"id":"C1","name":"general","topic":{"value":"Hello"}},{"id":"D1","user":"U2","is_im":true,"unread_count_display":2},{"id":"C1","name":"general"}]}`)
+			if request.Form.Get("types") != "public_channel,private_channel,mpim,im" || request.Form.Get("limit") != "200" {
+				t.Errorf("users.conversations form = %q", request.Form.Encode())
+			}
+			writeJSON(writer, `{"ok":true,"channels":[{"id":"C1","name":"general","topic":{"value":"Hello"},"is_starred":true},{"id":"D1","user":"U2","is_im":true,"unread_count_display":2},{"id":"C1","name":"general"}]}`)
 		case "conversations.history":
+			if request.Form.Get("channel") != "C1" || request.Form.Get("limit") != "15" || request.Form.Get("include_all_metadata") != "1" {
+				t.Errorf("conversations.history form = %q", request.Form.Encode())
+			}
 			writeJSON(writer, `{"ok":true,"messages":[
           {"type":"message","ts":"200.000002","user":"U2","text":"newer"},
           {"type":"message","ts":"100.000001","user":"U1","text":"older","blocks":[{"type":"actions","block_id":"b","elements":[{"type":"button","action_id":"go","text":{"type":"plain_text","text":"Go"},"value":"1"}]}]}
         ]}`)
 		case "search.messages":
+			if request.Method != http.MethodPost {
+				t.Errorf("search.messages method = %s, want SDK form POST", request.Method)
+			}
+			if request.Form.Get("query") != "needle" || request.Form.Get("count") != "15" {
+				t.Errorf("search.messages form = %q", request.Form.Encode())
+			}
 			writeJSON(writer, `{"ok":true,"messages":{"matches":[{"ts":"200.000002","user":"U2","text":"needle","channel":{"id":"C1","name":"general"}}]}}`)
 		case "reactions.add":
+			if request.Form.Get("channel") != "C1" || request.Form.Get("timestamp") != "200.000002" || request.Form.Get("name") != "eyes" {
+				t.Errorf("reactions.add form = %q", request.Form.Encode())
+			}
 			writeJSON(writer, `{"ok":true}`)
 		case "chat.update":
+			if request.Form.Get("channel") != "C1" || request.Form.Get("ts") != "200.000002" || request.Form.Get("text") != "edited" {
+				t.Errorf("chat.update form = %q", request.Form.Encode())
+			}
 			writeJSON(writer, `{"ok":true,"channel":"C1","ts":"200.000002","text":"edited","message":{"ts":"200.000002","user":"U1","text":"edited","edited":{}}}`)
 		default:
 			http.Error(writer, `{"ok":false,"error":"unknown_method"}`, http.StatusNotFound)
@@ -62,6 +83,9 @@ func TestClientBootstrapMessagesSearchAndReaction(t *testing.T) {
 	}
 	if snapshot.Team != "Acme" || snapshot.Self.DisplayName() != "Alex" || len(snapshot.Conversations) != 2 || snapshot.Conversations[1].Label() != "@Maya" {
 		t.Fatalf("bad snapshot: %#v", snapshot)
+	}
+	if !snapshot.Conversations[0].IsFavorite {
+		t.Fatalf("Slack favorite was not preserved: %#v", snapshot.Conversations[0])
 	}
 	messages, err := client.Messages(context.Background(), "C1")
 	if err != nil {
@@ -380,20 +404,17 @@ func jsonResponse(body string) *http.Response {
 }
 
 func TestHistoryPagingSendsCursorAndPreservesDisplayOrder(t *testing.T) {
-	var requests []map[string]any
+	var requests []map[string]string
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		parameters := map[string]any{}
-		if strings.TrimPrefix(request.URL.Path, "/") == "conversations.replies" {
-			if request.Method != http.MethodGet {
-				t.Errorf("conversations.replies method = %s, want GET", request.Method)
-			}
-			for key, values := range request.URL.Query() {
-				parameters[key] = values[0]
-			}
-		} else {
-			if err := json.NewDecoder(request.Body).Decode(&parameters); err != nil {
-				t.Fatal(err)
-			}
+		if request.Method != http.MethodPost {
+			t.Errorf("%s method = %s, want SDK form POST", request.URL.Path, request.Method)
+		}
+		if err := request.ParseForm(); err != nil {
+			t.Errorf("parse Slack SDK request: %v", err)
+		}
+		parameters := make(map[string]string, len(request.Form))
+		for key, values := range request.Form {
+			parameters[key] = values[0]
 		}
 		requests = append(requests, parameters)
 		writeJSON(writer, `{"ok":true,"messages":[{"ts":"2.0","text":"new"},{"ts":"1.0","text":"old"}],"response_metadata":{"next_cursor":"next-page"}}`)
