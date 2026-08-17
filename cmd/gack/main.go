@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime/debug"
 	"strconv"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -23,7 +24,7 @@ func main() {
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 	if *showVersion {
-		fmt.Println("gack " + version)
+		fmt.Println("gack " + buildVersion())
 		return
 	}
 
@@ -62,6 +63,17 @@ func main() {
 		fmt.Fprintln(os.Stderr, "gack:", err)
 		os.Exit(1)
 	}
+}
+
+func buildVersion() string {
+	if version != "dev" {
+		return version
+	}
+	info, ok := debug.ReadBuildInfo()
+	if ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return version
 }
 
 func firstNonEmpty(values ...string) string {
