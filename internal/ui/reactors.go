@@ -30,15 +30,45 @@ func bootstrapCmd(backend gack.Backend) tea.Cmd {
 
 func messagesCmd(backend gack.Backend, channel string) tea.Cmd {
 	return (applicationEffect{timeout: 30 * time.Second, run: func(ctx context.Context) applicationEvent {
+		if pager, ok := backend.(gack.HistoryPager); ok {
+			page, err := pager.MessagePage(ctx, channel, "")
+			return messagesResult{channel: channel, messages: page.Messages, nextCursor: page.NextCursor, err: err}
+		}
 		messages, err := backend.Messages(ctx, channel)
 		return messagesResult{channel: channel, messages: messages, err: err}
 	}}).command()
 }
 
+func moreMessagesCmd(backend gack.Backend, channel, cursor string) tea.Cmd {
+	return (applicationEffect{timeout: 30 * time.Second, run: func(ctx context.Context) applicationEvent {
+		pager, ok := backend.(gack.HistoryPager)
+		if !ok {
+			return messagesResult{channel: channel, more: true}
+		}
+		page, err := pager.MessagePage(ctx, channel, cursor)
+		return messagesResult{channel: channel, messages: page.Messages, nextCursor: page.NextCursor, more: true, err: err}
+	}}).command()
+}
+
 func threadCmd(backend gack.Backend, channel, thread string) tea.Cmd {
 	return (applicationEffect{timeout: 30 * time.Second, run: func(ctx context.Context) applicationEvent {
+		if pager, ok := backend.(gack.HistoryPager); ok {
+			page, err := pager.ThreadPage(ctx, channel, thread, "")
+			return threadResult{channel: channel, thread: thread, replies: page.Messages, nextCursor: page.NextCursor, err: err}
+		}
 		replies, err := backend.Thread(ctx, channel, thread)
 		return threadResult{channel: channel, thread: thread, replies: replies, err: err}
+	}}).command()
+}
+
+func moreThreadCmd(backend gack.Backend, channel, thread, cursor string) tea.Cmd {
+	return (applicationEffect{timeout: 30 * time.Second, run: func(ctx context.Context) applicationEvent {
+		pager, ok := backend.(gack.HistoryPager)
+		if !ok {
+			return threadResult{channel: channel, thread: thread, more: true}
+		}
+		page, err := pager.ThreadPage(ctx, channel, thread, cursor)
+		return threadResult{channel: channel, thread: thread, replies: page.Messages, nextCursor: page.NextCursor, more: true, err: err}
 	}}).command()
 }
 
@@ -69,10 +99,20 @@ func searchCmd(backend gack.Backend, query string) tea.Cmd {
 	}}).command()
 }
 
-func activityCmd(backend gack.Backend) tea.Cmd {
+func activityCmd(backend gack.Backend, background bool) tea.Cmd {
 	return (applicationEffect{timeout: 30 * time.Second, run: func(ctx context.Context) applicationEvent {
 		items, err := backend.Activity(ctx)
-		return activityResult{items: items, err: err}
+		return activityResult{items: items, background: background, err: err}
+	}}).command()
+}
+
+func scheduleActivityPoll(delay time.Duration) tea.Cmd {
+	return tea.Tick(delay, func(time.Time) tea.Msg { return activityPollTick{} })
+}
+
+func notificationCmd(send func(context.Context, string, string) error, title, body string) tea.Cmd {
+	return (applicationEffect{timeout: 5 * time.Second, run: func(ctx context.Context) applicationEvent {
+		return notificationResult{err: send(ctx, title, body)}
 	}}).command()
 }
 
@@ -104,6 +144,7 @@ func saveSidebarCmd(state *sidebarSaveState, save func(config.SidebarPreferences
 			return sidebarSaved{revision: revision, notice: notice}
 		}
 		preferences.ChannelOrder = append([]string(nil), preferences.ChannelOrder...)
+		preferences.Groups = append([]config.SidebarGroup(nil), preferences.Groups...)
 		return sidebarSaved{revision: revision, notice: notice, err: save(preferences)}
 	}}).command()
 }

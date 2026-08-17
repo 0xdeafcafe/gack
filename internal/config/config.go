@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 )
 
 // SidebarSort controls how conversations are presented in the sidebar. The
@@ -52,9 +53,37 @@ func (sort SidebarSort) Label() string {
 }
 
 type Preferences struct {
-	ChannelOrder  []string    `json:"channel_order,omitempty"`
-	SidebarSort   SidebarSort `json:"sidebar_sort,omitempty"`
-	SlackClientID string      `json:"slack_client_id,omitempty"`
+	ChannelOrder  []string       `json:"channel_order,omitempty"`
+	SidebarSort   SidebarSort    `json:"sidebar_sort,omitempty"`
+	SidebarGroups []SidebarGroup `json:"sidebar_groups,omitempty"`
+	SlackClientID string         `json:"slack_client_id,omitempty"`
+}
+
+// SidebarGroup assigns the first matching channel name to a local section.
+// Slack does not expose a supported Web API for a user's custom sidebar
+// sections, so gack keeps these lightweight regex rules in its own config.
+type SidebarGroup struct {
+	Name    string `json:"name"`
+	Pattern string `json:"pattern"`
+}
+
+func NormalizeGroups(groups []SidebarGroup) []SidebarGroup {
+	result := make([]SidebarGroup, 0, len(groups))
+	seen := make(map[string]struct{}, len(groups))
+	for _, group := range groups {
+		group.Name = strings.TrimSpace(group.Name)
+		group.Pattern = strings.TrimSpace(group.Pattern)
+		key := strings.ToLower(group.Name)
+		if group.Name == "" || group.Pattern == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, group)
+	}
+	return result
 }
 
 // SidebarPreferences is the small subset of Preferences owned by the TUI.
@@ -63,6 +92,7 @@ type Preferences struct {
 type SidebarPreferences struct {
 	ChannelOrder []string
 	Sort         SidebarSort
+	Groups       []SidebarGroup
 }
 
 func Path() (string, error) {
@@ -90,6 +120,7 @@ func Load() (Preferences, error) {
 		return Preferences{}, err
 	}
 	preferences.SidebarSort = preferences.SidebarSort.Normalize()
+	preferences.SidebarGroups = NormalizeGroups(preferences.SidebarGroups)
 	return preferences, nil
 }
 
@@ -102,6 +133,7 @@ func Save(preferences Preferences) error {
 		return err
 	}
 	preferences.SidebarSort = preferences.SidebarSort.Normalize()
+	preferences.SidebarGroups = NormalizeGroups(preferences.SidebarGroups)
 	data, err := json.MarshalIndent(preferences, "", "  ")
 	if err != nil {
 		return err

@@ -254,29 +254,51 @@ type slackMessage struct {
 
 type messagesResponse struct {
 	Messages         []slackMessage `json:"messages"`
+	HasMore          bool           `json:"has_more"`
 	ResponseMetadata struct {
 		NextCursor string `json:"next_cursor"`
 	} `json:"response_metadata"`
 }
 
 func (c *Client) Messages(ctx context.Context, channel string) ([]gack.Message, error) {
+	page, err := c.MessagePage(ctx, channel, "")
+	return page.Messages, err
+}
+
+func (c *Client) MessagePage(ctx context.Context, channel, cursor string) (gack.HistoryPage, error) {
 	var response messagesResponse
-	if err := c.call(ctx, "conversations.history", map[string]any{"channel": channel, "limit": c.messageLimit, "include_all_metadata": true}, &response); err != nil {
-		return nil, err
+	params := map[string]any{"channel": channel, "limit": c.messageLimit, "include_all_metadata": true}
+	if cursor != "" {
+		params["cursor"] = cursor
+	}
+	if err := c.call(ctx, "conversations.history", params, &response); err != nil {
+		return gack.HistoryPage{}, err
 	}
 	result := c.convertMessages(channel, response.Messages)
 	for left, right := 0, len(result)-1; left < right; left, right = left+1, right-1 {
 		result[left], result[right] = result[right], result[left]
 	}
-	return result, nil
+	return gack.HistoryPage{Messages: result, NextCursor: strings.TrimSpace(response.ResponseMetadata.NextCursor)}, nil
 }
 
 func (c *Client) Thread(ctx context.Context, channel, thread string) ([]gack.Message, error) {
+	page, err := c.ThreadPage(ctx, channel, thread, "")
+	return page.Messages, err
+}
+
+func (c *Client) ThreadPage(ctx context.Context, channel, thread, cursor string) (gack.HistoryPage, error) {
 	var response messagesResponse
-	if err := c.call(ctx, "conversations.replies", map[string]any{"channel": channel, "ts": thread, "limit": c.messageLimit}, &response); err != nil {
-		return nil, err
+	params := map[string]any{"channel": channel, "ts": thread, "limit": c.messageLimit}
+	if cursor != "" {
+		params["cursor"] = cursor
 	}
-	return c.convertMessages(channel, response.Messages), nil
+	if err := c.call(ctx, "conversations.replies", params, &response); err != nil {
+		return gack.HistoryPage{}, err
+	}
+	return gack.HistoryPage{
+		Messages:   c.convertMessages(channel, response.Messages),
+		NextCursor: strings.TrimSpace(response.ResponseMetadata.NextCursor),
+	}, nil
 }
 
 func (c *Client) convertMessages(channel string, messages []slackMessage) []gack.Message {
@@ -436,18 +458,28 @@ func (c *Client) Interact(ctx context.Context, interaction gack.Interaction) (ga
 }
 
 type apiEnvelope struct {
-	OK      bool            `json:"ok"`
-	Error   string          `json:"error"`
-	Warning string          `json:"warning"`
-	Raw     json.RawMessage `json:"-"`
+	OK               bool   `json:"ok"`
+	Error            string `json:"error"`
+	Warning          string `json:"warning"`
+	ResponseMetadata struct {
+		Messages []string `json:"messages"`
+	} `json:"response_metadata"`
+	Raw json.RawMessage `json:"-"`
 }
 
 type APIError struct {
-	Method string
-	Code   string
+	Method  string
+	Code    string
+	Details []string
 }
 
-func (e *APIError) Error() string { return fmt.Sprintf("Slack %s: %s", e.Method, e.Code) }
+func (e *APIError) Error() string {
+	message := fmt.Sprintf("Slack %s: %s", e.Method, e.Code)
+	if len(e.Details) > 0 {
+		message += " (" + strings.Join(e.Details, "; ") + ")"
+	}
+	return message
+}
 
 func (c *Client) call(ctx context.Context, method string, params map[string]any, output any) error {
 	if params == nil {
@@ -495,7 +527,7 @@ func (c *Client) call(ctx context.Context, method string, params map[string]any,
 			return fmt.Errorf("Slack %s decode: %w", method, err)
 		}
 		if !envelope.OK {
-			return &APIError{Method: method, Code: envelope.Error}
+			return &APIError{Method: method, Code: envelope.Error, Details: envelope.ResponseMetadata.Messages}
 		}
 		if output != nil {
 			if err := json.Unmarshal(data, output); err != nil {

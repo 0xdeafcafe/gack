@@ -20,6 +20,19 @@ type Backend interface {
 	Interact(context.Context, Interaction) (InteractionResult, error)
 }
 
+// HistoryPager is an optional backend capability. The UI discovers it at
+// runtime, so small embedders can keep implementing Backend while Slack-backed
+// sessions gain incremental history without loading an unbounded transcript.
+type HistoryPager interface {
+	MessagePage(context.Context, string, string) (HistoryPage, error)
+	ThreadPage(context.Context, string, string, string) (HistoryPage, error)
+}
+
+type HistoryPage struct {
+	Messages   []Message
+	NextCursor string
+}
+
 type Snapshot struct {
 	Team          string
 	Self          User

@@ -90,13 +90,39 @@ func TestClientBootstrapMessagesSearchAndReaction(t *testing.T) {
 
 func TestClientReportsSlackAPIErrors(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		writeJSON(writer, `{"ok":false,"error":"missing_scope"}`)
+		writeJSON(writer, `{"ok":false,"error":"missing_scope","response_metadata":{"messages":["[ERROR] required scope: search:read"]}}`)
 	}))
 	defer server.Close()
 	client, _ := New(Config{Token: "test", BaseURL: server.URL})
 	_, err := client.Search(context.Background(), "anything")
-	if err == nil || !strings.Contains(err.Error(), "missing_scope") {
+	if err == nil || !strings.Contains(err.Error(), "missing_scope") || !strings.Contains(err.Error(), "required scope: search:read") {
 		t.Fatalf("expected useful Slack API error, got %v", err)
+	}
+}
+
+func TestHistoryPagingSendsCursorAndPreservesDisplayOrder(t *testing.T) {
+	var requests []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var parameters map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&parameters); err != nil {
+			t.Fatal(err)
+		}
+		requests = append(requests, parameters)
+		writeJSON(writer, `{"ok":true,"messages":[{"ts":"2.0","text":"new"},{"ts":"1.0","text":"old"}],"response_metadata":{"next_cursor":"next-page"}}`)
+	}))
+	defer server.Close()
+	client, _ := New(Config{Token: "test", BaseURL: server.URL, MessageLimit: 15})
+
+	history, err := client.MessagePage(context.Background(), "C1", "cursor-1")
+	if err != nil || history.NextCursor != "next-page" || len(history.Messages) != 2 || history.Messages[0].Text != "old" {
+		t.Fatalf("history page = %#v, %v", history, err)
+	}
+	thread, err := client.ThreadPage(context.Background(), "C1", "root.1", "cursor-2")
+	if err != nil || len(thread.Messages) != 2 || thread.Messages[0].Text != "new" {
+		t.Fatalf("thread page = %#v, %v", thread, err)
+	}
+	if requests[0]["cursor"] != "cursor-1" || requests[0]["channel"] != "C1" || requests[1]["cursor"] != "cursor-2" || requests[1]["ts"] != "root.1" {
+		t.Fatalf("paging requests = %#v", requests)
 	}
 }
 

@@ -37,6 +37,7 @@ var (
 	floatingBorder = lipgloss.NewStyle().Border(lipgloss.DoubleBorder()).BorderForeground(purple)
 	selectedStyle  = lipgloss.NewStyle().Foreground(purple).Bold(true)
 	selectedRow    = lipgloss.NewStyle().Foreground(ink).Background(selection)
+	hoveredRow     = lipgloss.NewStyle().Foreground(ink).Background(soft)
 	selectedNav    = lipgloss.NewStyle().Foreground(white).Background(deepPurple).Bold(true)
 	dimStyle       = lipgloss.NewStyle().Foreground(muted)
 	errorStyle     = lipgloss.NewStyle().Foreground(danger).Bold(true)
@@ -108,6 +109,9 @@ func (m *Model) renderHeader() string {
 	brandLine = headerStyle.Width(max(0, m.width)).Render(brandLine)
 
 	focus := " YOU ARE HERE  ›  " + location + "  ›  " + m.focusPath()
+	if pointer := m.pointerPath(); pointer != "" && m.width >= 84 {
+		focus = joinAcross(focus, "POINTER › "+pointer+" ", m.width)
+	}
 	locationLine := locationStyle.Width(max(0, m.width)).Render(truncate(focus, max(1, m.width)))
 	return brandLine + "\n" + locationLine
 }
@@ -283,36 +287,67 @@ func (m *Model) renderSidebar(width, height int) string {
 		}
 	}
 	lines = append(lines,
-		paneHeading("Workspace", m.focus == focusSidebar, innerWidth),
+		paneHeading("Workspace", m.focus == focusSidebar, m.hoverPane == focusSidebar, innerWidth),
 		dimStyle.Render("  PRIORITY"),
-		m.sidebarLine("  ●  Notifications", unreadActivity, m.sidebarAt == 0 && m.focus == focusSidebar, m.mode == viewNotifications, innerWidth),
-		m.sidebarLine("  ◷  Activity", len(m.activity), m.sidebarAt == 1 && m.focus == focusSidebar, m.mode == viewActivity, innerWidth),
+		m.sidebarLine("  ●  Notifications", unreadActivity, m.sidebarAt == 0 && m.focus == focusSidebar, m.mode == viewNotifications, m.hoverSidebarAt == 0, innerWidth),
+		m.sidebarLine("  ◷  Activity", len(m.activity), m.sidebarAt == 1 && m.focus == focusSidebar, m.mode == viewActivity, m.hoverSidebarAt == 1, innerWidth),
 		"",
 	)
-	// Reserve one row for the channel group heading so a long list still has a
-	// clear label and visible position within the virtualized window.
 	available := max(0, innerHeight-len(lines)-1)
 	cursor := m.channel
 	if m.sidebarAt >= 2 {
 		cursor = m.sidebarAt - 2
 	}
-	start := max(0, cursor-available/2)
-	if start+available > len(m.channels) {
-		start = max(0, len(m.channels)-available)
+	displayRows := m.sidebarDisplayRows()
+	cursorRow := 0
+	for index, row := range displayRows {
+		if row.channelIndex == cursor {
+			cursorRow = index
+			break
+		}
 	}
-	end := min(len(m.channels), start+available)
+	start := max(0, cursorRow-available/2)
+	if start+available > len(displayRows) {
+		start = max(0, len(displayRows)-available)
+	}
+	end := min(len(displayRows), start+available)
 	rangeLabel := fmt.Sprintf("%d CHANNELS", len(m.channels))
-	if len(m.channels) > available && available > 0 {
-		rangeLabel = fmt.Sprintf("CHANNELS  %d–%d OF %d", start+1, end, len(m.channels))
+	channelsBefore, channelsShown := 0, 0
+	for index, row := range displayRows {
+		if row.channelIndex < 0 {
+			continue
+		}
+		if index < start {
+			channelsBefore++
+		} else if index < end {
+			channelsShown++
+		}
+	}
+	if channelsShown < len(m.channels) && channelsShown > 0 {
+		rangeLabel = fmt.Sprintf("CHANNELS %d–%d OF %d", channelsBefore+1, channelsBefore+channelsShown, len(m.channels))
+	}
+	if len(m.sidebarGroupRules) > 0 {
+		if innerWidth < 36 {
+			rangeLabel = fmt.Sprintf("%d CH · %d GRP", len(m.channels), len(m.sidebarGroupRules))
+		} else {
+			rangeLabel += fmt.Sprintf(" · %d GROUPS", len(m.sidebarGroupRules))
+		}
 	}
 	sortLabel := "s: " + strings.ToUpper(m.sidebarSortLabel())
 	lines = append(lines, joinAcross(dimStyle.Render("  "+rangeLabel), dimStyle.Render(sortLabel), innerWidth))
-	m.visibleChannelStart = start
-	// Global terminal row: the app header, pane border, then the sidebar rows
-	// above the first channel. Keep this derived from the rendered structure so
-	// mouse dragging stays correct as the navigation chrome evolves.
-	m.channelRowStart = lipgloss.Height(m.renderHeader()) + 1 + len(lines)
-	for index := start; index < len(m.channels) && len(lines) < innerHeight; index++ {
+	m.visibleSidebarHits = m.visibleSidebarHits[:0]
+	m.visibleChannelStart = 0
+	m.channelRowStart = 0
+	firstChannel := true
+	globalRow := lipgloss.Height(m.renderHeader()) + 1 + len(lines)
+	for rowIndex := start; rowIndex < end && len(lines) < innerHeight; rowIndex++ {
+		row := displayRows[rowIndex]
+		if row.channelIndex < 0 {
+			lines = append(lines, dimStyle.Render(truncate("  ─ "+strings.ToUpper(row.label), innerWidth)))
+			globalRow++
+			continue
+		}
+		index := row.channelIndex
 		channel := m.channels[index]
 		label := channel.Label()
 		if channel.IsFavorite {
@@ -323,7 +358,14 @@ func (m *Model) renderSidebar(width, height int) string {
 		if index == m.dragAt {
 			label = "↕ " + label
 		}
-		lines = append(lines, m.sidebarLine(label, channel.Unread, m.sidebarAt == index+2 && m.focus == focusSidebar, index == m.channel && m.mode == viewConversation, innerWidth))
+		if firstChannel {
+			m.visibleChannelStart = index
+			m.channelRowStart = globalRow
+			firstChannel = false
+		}
+		m.visibleSidebarHits = append(m.visibleSidebarHits, sidebarHit{y: globalRow, channelIndex: index})
+		lines = append(lines, m.sidebarLine(label, channel.Unread, m.sidebarAt == index+2 && m.focus == focusSidebar, index == m.channel && m.mode == viewConversation, m.hoverSidebarAt == index+2, innerWidth))
+		globalRow++
 	}
 	for len(lines) < innerHeight {
 		lines = append(lines, "")
@@ -335,7 +377,48 @@ func (m *Model) renderSidebar(width, height int) string {
 	return style.Width(innerWidth).Height(innerHeight).Render(cropLines(strings.Join(lines, "\n"), innerHeight, innerWidth))
 }
 
-func (m *Model) sidebarLine(label string, count int, selected, current bool, width int) string {
+type sidebarDisplayRow struct {
+	label        string
+	channelIndex int
+}
+
+func (m *Model) sidebarDisplayRows() []sidebarDisplayRow {
+	if len(m.sidebarGroupRules) == 0 {
+		rows := []sidebarDisplayRow{{label: "Channels", channelIndex: -1}}
+		for index := range m.channels {
+			rows = append(rows, sidebarDisplayRow{channelIndex: index})
+		}
+		return rows
+	}
+	sections := make([][]int, len(m.sidebarGroupRules)+1)
+	for index, channel := range m.channels {
+		section := len(m.sidebarGroupRules)
+		for ruleIndex, rule := range m.sidebarGroupRules {
+			if rule.pattern.MatchString(channel.Name) || rule.pattern.MatchString(channel.Label()) {
+				section = ruleIndex
+				break
+			}
+		}
+		sections[section] = append(sections[section], index)
+	}
+	rows := make([]sidebarDisplayRow, 0, len(m.channels)+len(sections))
+	for section, indexes := range sections {
+		if len(indexes) == 0 {
+			continue
+		}
+		label := "Other"
+		if section < len(m.sidebarGroupRules) {
+			label = m.sidebarGroupRules[section].name
+		}
+		rows = append(rows, sidebarDisplayRow{label: fmt.Sprintf("%s (%d)", label, len(indexes)), channelIndex: -1})
+		for _, index := range indexes {
+			rows = append(rows, sidebarDisplayRow{channelIndex: index})
+		}
+	}
+	return rows
+}
+
+func (m *Model) sidebarLine(label string, count int, selected, current, hovered bool, width int) string {
 	badge := ""
 	if count > 0 {
 		badge = fmt.Sprintf(" ● %d", count)
@@ -355,6 +438,9 @@ func (m *Model) sidebarLine(label string, count int, selected, current bool, wid
 	if current {
 		return selectedRow.Bold(true).Width(width).Render(line)
 	}
+	if hovered {
+		return hoveredRow.Width(width).Render(line)
+	}
 	if count > 0 {
 		return lipgloss.NewStyle().Bold(true).Width(width).Render(line)
 	}
@@ -371,13 +457,13 @@ func (m *Model) renderConversation(width, height int) string {
 		}
 	}
 	contentHeight := max(1, height-3)
-	measure, inset := readingColumn(max(1, width-2), 94)
-	content := m.virtualMessages(m.messages, m.message, contentHeight, measure, m.focus == focusMessages)
+	measure, inset := readingColumn(max(1, width-2), 112)
+	content := m.virtualMessagesHovered(m.messages, m.message, contentHeight, measure, m.focus == focusMessages, m.hoverMessage)
 	if len(m.messages) == 0 && m.busy == "" {
 		content = dimStyle.Render("No messages in this conversation.")
 	}
 	content = insetLines(content, inset)
-	return m.renderPane(title, content, width, height, m.focus == focusMessages)
+	return m.renderPane(title, content, width, height, m.focus == focusMessages, m.hoverPane == focusMessages)
 }
 
 func (m *Model) renderThread(width, height int) string {
@@ -386,12 +472,12 @@ func (m *Model) renderThread(width, height int) string {
 		title += dimStyle.Render(fmt.Sprintf("  %d replies", max(0, len(m.thread)-1)))
 	}
 	measure, inset := readingColumn(max(1, width-2), 72)
-	content := m.virtualMessages(m.thread, m.threadAt, max(1, height-3), measure, m.focus == focusThread)
+	content := m.virtualMessagesHovered(m.thread, m.threadAt, max(1, height-3), measure, m.focus == focusThread, m.hoverThread)
 	if len(m.thread) == 0 {
 		content = dimStyle.Render("Loading thread…")
 	}
 	content = insetLines(content, inset)
-	return m.renderPane(title, content, width, height, m.focus == focusThread)
+	return m.renderPane(title, content, width, height, m.focus == focusThread, m.hoverPane == focusThread)
 }
 
 func (m *Model) renderActivity(width, height int) string {
@@ -402,7 +488,7 @@ func (m *Model) renderActivity(width, height int) string {
 	items := m.filteredActivity()
 	contentHeight := max(1, height-3)
 	if len(items) == 0 {
-		return m.renderPane(title, dimStyle.Render("You’re all caught up."), width, height, m.focus != focusSidebar)
+		return m.renderPane(title, dimStyle.Render("You’re all caught up."), width, height, m.focus != focusSidebar, m.hoverPane == focusMessages)
 	}
 	itemHeight := 4
 	visible := max(1, contentHeight/itemHeight)
@@ -431,15 +517,15 @@ func (m *Model) renderActivity(width, height int) string {
 		}
 		rendered = append(rendered, itemView)
 	}
-	return m.renderPane(title, insetLines(strings.Join(rendered, "\n\n"), inset), width, height, m.focus != focusSidebar)
+	return m.renderPane(title, insetLines(strings.Join(rendered, "\n\n"), inset), width, height, m.focus != focusSidebar, m.hoverPane == focusMessages)
 }
 
-func (m *Model) renderPane(title, content string, width, height int, active bool) string {
+func (m *Model) renderPane(title, content string, width, height int, active, hovered bool) string {
 	if width <= 2 || height <= 2 {
 		return ""
 	}
 	innerWidth, innerHeight := width-2, height-2
-	titleLine := paneHeading(title, active, innerWidth)
+	titleLine := paneHeading(title, active, hovered, innerWidth)
 	contentHeight := max(0, innerHeight-1)
 	content = cropLines(content, contentHeight, innerWidth)
 	if contentHeight > 0 {
@@ -454,57 +540,120 @@ func (m *Model) renderPane(title, content string, width, height int, active bool
 	return style.Width(innerWidth).Height(innerHeight).Render(content)
 }
 
+type virtualMessageRow struct {
+	index  int
+	value  string
+	height int
+}
+
 func (m *Model) virtualMessages(messages []gack.Message, selected, height, width int, active bool) string {
+	return m.virtualMessagesHovered(messages, selected, height, width, active, -1)
+}
+
+func (m *Model) virtualMessagesHovered(messages []gack.Message, selected, height, width int, active bool, hovered int) string {
+	rows := m.virtualMessageRows(messages, selected, height, width, active, hovered)
+	parts := make([]string, len(rows))
+	for i, row := range rows {
+		parts[i] = row.value
+	}
+	return strings.Join(parts, "\n")
+}
+
+func (m *Model) virtualMessageRows(messages []gack.Message, selected, height, width int, active bool, hovered int) []virtualMessageRow {
 	if len(messages) == 0 || height <= 0 {
-		return ""
+		return nil
 	}
 	selected = max(0, min(len(messages)-1, selected))
-	type renderedMessage struct {
-		index  int
-		value  string
-		height int
+	current := m.renderMessageGrouped(messages[selected], width, active, selected, false)
+	if selected == hovered && !active {
+		current = styleLines(current, hoveredRow, width)
 	}
-	current := m.renderMessage(messages[selected], width, active, selected)
-	rows := []renderedMessage{{selected, current, max(1, lipgloss.Height(current))}}
+	if lipgloss.Height(current) > height {
+		current = cropLines(current, height, width)
+	}
+	rows := []virtualMessageRow{{selected, current, max(1, lipgloss.Height(current))}}
 	used := rows[0].height
 	// Fill beneath the cursor first, then use all remaining rows above it. Only
 	// visible messages are formatted, so a very large backing history has flat
 	// rendering cost.
 	for index := selected + 1; index < len(messages) && used < height/2; index++ {
-		value := m.renderMessage(messages[index], width, false, index)
-		h := max(1, lipgloss.Height(value)) + 1
+		value := m.renderMessageGrouped(messages[index], width, false, index, messagesAreGrouped(messages[index-1], messages[index]))
+		if index == hovered {
+			value = styleLines(value, hoveredRow, width)
+		}
+		h := max(1, lipgloss.Height(value))
 		if used+h > height {
+			remaining := height - used
+			if remaining > 0 {
+				value = cropLines(value, remaining, width)
+				rows = append(rows, virtualMessageRow{index, value, remaining})
+				used = height
+			}
 			break
 		}
-		rows = append(rows, renderedMessage{index, value, h})
+		rows = append(rows, virtualMessageRow{index, value, h})
 		used += h
 	}
 	for index := selected - 1; index >= 0 && used < height; index-- {
-		value := m.renderMessage(messages[index], width, false, index)
-		h := max(1, lipgloss.Height(value)) + 1
+		grouped := index > 0 && messagesAreGrouped(messages[index-1], messages[index])
+		value := m.renderMessageGrouped(messages[index], width, false, index, grouped)
+		if index == hovered {
+			value = styleLines(value, hoveredRow, width)
+		}
+		h := max(1, lipgloss.Height(value))
 		if used+h > height {
+			remaining := height - used
+			if remaining > 0 {
+				lines := strings.Split(value, "\n")
+				value = strings.Join(lines[max(0, len(lines)-remaining):], "\n")
+				rows = append([]virtualMessageRow{{index, value, remaining}}, rows...)
+				used = height
+			}
 			break
 		}
-		rows = append([]renderedMessage{{index, value, h}}, rows...)
+		rows = append([]virtualMessageRow{{index, value, h}}, rows...)
 		used += h
 	}
 	for index := rows[len(rows)-1].index + 1; index < len(messages) && used < height; index++ {
-		value := m.renderMessage(messages[index], width, false, index)
-		h := max(1, lipgloss.Height(value)) + 1
+		value := m.renderMessageGrouped(messages[index], width, false, index, messagesAreGrouped(messages[index-1], messages[index]))
+		if index == hovered {
+			value = styleLines(value, hoveredRow, width)
+		}
+		h := max(1, lipgloss.Height(value))
 		if used+h > height {
+			remaining := height - used
+			if remaining > 0 {
+				value = cropLines(value, remaining, width)
+				rows = append(rows, virtualMessageRow{index, value, remaining})
+				used = height
+			}
 			break
 		}
-		rows = append(rows, renderedMessage{index, value, h})
+		rows = append(rows, virtualMessageRow{index, value, h})
 		used += h
 	}
-	parts := make([]string, len(rows))
-	for i, row := range rows {
-		parts[i] = row.value
+	return rows
+}
+
+func (m *Model) messageAtViewportRow(messages []gack.Message, selected, height, width, row int) int {
+	if row < 0 || row >= height {
+		return -1
 	}
-	return strings.Join(parts, "\n\n")
+	offset := 0
+	for _, rendered := range m.virtualMessageRows(messages, selected, height, width, false, -1) {
+		if row >= offset && row < offset+rendered.height {
+			return rendered.index
+		}
+		offset += rendered.height
+	}
+	return -1
 }
 
 func (m *Model) renderMessage(message gack.Message, width int, selected bool, index int) string {
+	return m.renderMessageGrouped(message, width, selected, index, false)
+}
+
+func (m *Model) renderMessageGrouped(message gack.Message, width int, selected bool, index int, grouped bool) string {
 	marker := "  "
 	if selected {
 		marker = selectedStyle.Render("▌ ")
@@ -517,6 +666,9 @@ func (m *Model) renderMessage(message gack.Message, width int, selected bool, in
 		username = "unknown"
 	}
 	heading := marker + lipgloss.NewStyle().Bold(true).Render(username) + dimStyle.Render("  "+message.Time.Format("15:04"))
+	if grouped && !selected {
+		heading = marker + dimStyle.Render("↳  "+message.Time.Format("15:04"))
+	}
 	if message.Edited {
 		heading += dimStyle.Render("  edited")
 	}
@@ -596,6 +748,17 @@ func (m *Model) renderMessage(message gack.Message, width int, selected bool, in
 		messageView = styleLines(messageView, selectedRow, width)
 	}
 	return messageView
+}
+
+func messagesAreGrouped(previous, current gack.Message) bool {
+	if previous.Time.IsZero() || current.Time.IsZero() {
+		return false
+	}
+	sameAuthor := previous.UserID != "" && previous.UserID == current.UserID
+	if !sameAuthor {
+		sameAuthor = previous.UserID == "" && previous.Username != "" && previous.Username == current.Username
+	}
+	return sameAuthor && current.Time.Sub(previous.Time) >= 0 && current.Time.Sub(previous.Time) <= 5*time.Minute
 }
 
 func (m *Model) renderSearch(background string, height int) string {
@@ -761,6 +924,7 @@ func (m *Model) renderHelp(background string, height int) string {
 		{"r", "Toggle reaction"}, {"i or 1–9", "Block Kit actions"},
 		{"a / n", "Activity / unread"}, {"Tab", "Move between panes"},
 		{"s", "Sort sidebar"}, {"Shift+J/K", "Reorder channel"},
+		{"g", "Show grouping command"},
 		{"R", "Refresh view"}, {"Mouse drag", "Reorder channels"},
 		{"Enter (write)", "Insert newline"}, {"Ctrl+S", "Send / submit"},
 		{"Esc", "Back / cancel"}, {"q", "Quit"},
@@ -865,6 +1029,36 @@ func (m *Model) focusedPaneName() string {
 	return "conversation"
 }
 
+func (m *Model) pointerPath() string {
+	switch m.hoverPane {
+	case focusSidebar:
+		switch m.hoverSidebarAt {
+		case 0:
+			return "Notifications"
+		case 1:
+			return "Activity"
+		default:
+			index := m.hoverSidebarAt - 2
+			if index >= 0 && index < len(m.channels) {
+				return m.channels[index].Label()
+			}
+			return "Sidebar"
+		}
+	case focusMessages:
+		if m.hoverMessage >= 0 && m.hoverMessage < len(m.messages) {
+			return fmt.Sprintf("Conversation message %d", m.hoverMessage+1)
+		}
+		return "Conversation"
+	case focusThread:
+		if m.hoverThread >= 0 && m.hoverThread < len(m.thread) {
+			return fmt.Sprintf("Thread reply %d", m.hoverThread+1)
+		}
+		return "Thread"
+	default:
+		return ""
+	}
+}
+
 func (m *Model) sidebarFocusLabel() string {
 	selected := m.sidebarSelection()
 	switch selected {
@@ -899,6 +1093,7 @@ func (m *Model) contextualHelp() string {
 			helpBinding("↑/↓", "select"),
 			helpBinding("Enter", "open"),
 			helpBinding("s", "sort"),
+			helpBinding("g", "groups"),
 			helpBinding("⇧J/K", "reorder"),
 			helpBinding("Tab", "next pane"),
 			helpBinding("?", "all keys"),
@@ -987,17 +1182,23 @@ func dialogFieldPosition(dialog *dialogState) (int, int) {
 	return position, count
 }
 
-func paneHeading(title string, active bool, width int) string {
+func paneHeading(title string, active, hovered bool, width int) string {
 	marker := dimStyle.Render("○")
 	label := lipgloss.NewStyle().Bold(true).Render(title)
 	right := ""
 	if active {
 		marker = selectedStyle.Render("◆")
 		right = selectedNav.Render(" ACTIVE PANE ")
+	} else if hovered {
+		marker = selectedStyle.Render("◇")
+		right = hoveredRow.Render(" POINTER ")
 	}
 	heading := joinAcross(marker+" "+label, right, width)
 	if active {
 		return selectedRow.Width(width).Render(heading)
+	}
+	if hovered {
+		return hoveredRow.Width(width).Render(heading)
 	}
 	return heading
 }
@@ -1006,14 +1207,14 @@ func helpBinding(keyName, description string) key.Binding {
 	return key.NewBinding(key.WithKeys(keyName), key.WithHelp(keyName, description))
 }
 
-// readingColumn gives message text a comfortable maximum measure and places
-// it slightly in from the pane edge. The pane may span a cinema-wide terminal;
-// prose should not. The unused columns deliberately become breathing room.
+// readingColumn keeps prose readable without making a wide terminal look like
+// an empty canvas. A small fixed gutter is enough spatial separation from the
+// pane border; the remaining width stays useful for messages and Block Kit.
 func readingColumn(available, maximum int) (measure, inset int) {
 	available = max(1, available)
 	inset = 1
 	if available > maximum+8 {
-		inset = min(12, max(2, (available-maximum)/5))
+		inset = 2
 	}
 	measure = max(8, min(maximum, available-inset))
 	return measure, inset

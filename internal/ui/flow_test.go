@@ -79,3 +79,29 @@ func TestReducerIgnoresStaleConversationEvents(t *testing.T) {
 		t.Fatal("current event was not reduced")
 	}
 }
+
+func TestBackgroundActivityNotifiesOnlyAfterBaseline(t *testing.T) {
+	model := readyDemoModel(t, 100, 30)
+	var titles, bodies []string
+	model.SetNotifier(func(_ context.Context, title, body string) error {
+		titles = append(titles, title)
+		bodies = append(bodies, body)
+		return nil
+	})
+	baseline := gack.ActivityItem{ID: "old", ChannelName: "alerts", Actor: "Bot", Text: "old", Unread: true}
+	model.reduce(activityResult{items: []gack.ActivityItem{baseline}, background: true})
+	if len(titles) != 0 || !model.activityPrimed {
+		t.Fatalf("baseline sent notifications: %v", titles)
+	}
+
+	newItem := gack.ActivityItem{ID: "new", ChannelName: "alerts", Actor: "Deploy bot", Text: "Production needs attention", Unread: true}
+	command := model.reduce(activityResult{items: []gack.ActivityItem{newItem, baseline}, background: true})
+	event, ok := command().(applicationEvent)
+	if !ok {
+		t.Fatalf("notification command returned %T", command())
+	}
+	model.reduce(event)
+	if len(titles) != 1 || titles[0] != "gack · #alerts · Deploy bot" || bodies[0] != "Production needs attention" {
+		t.Fatalf("notifications = %v %v", titles, bodies)
+	}
+}

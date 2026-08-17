@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -58,6 +59,26 @@ type sidebarSaveState struct {
 	mutex  sync.Mutex
 }
 
+type conversationViewState struct {
+	messages      []gack.Message
+	message       int
+	messageCursor string
+	threadTS      string
+	thread        []gack.Message
+	threadAt      int
+	threadCursor  string
+}
+
+type sidebarHit struct {
+	y            int
+	channelIndex int
+}
+
+type sidebarGroupRule struct {
+	name    string
+	pattern *regexp.Regexp
+}
+
 type ExitAction uint8
 
 const (
@@ -67,11 +88,13 @@ const (
 )
 
 type Model struct {
-	backend     gack.Backend
-	saveSidebar func(config.SidebarPreferences) error
-	saveState   *sidebarSaveState
-	order       []string
-	sidebarSort config.SidebarSort
+	backend           gack.Backend
+	saveSidebar       func(config.SidebarPreferences) error
+	saveState         *sidebarSaveState
+	order             []string
+	sidebarSort       config.SidebarSort
+	sidebarGroups     []config.SidebarGroup
+	sidebarGroupRules []sidebarGroupRule
 
 	width  int
 	height int
@@ -83,18 +106,30 @@ type Model struct {
 
 	connectStarted  time.Time
 	checkUpdate     func(context.Context) (string, error)
+	notify          func(context.Context, string, string) error
+	knownActivity   map[string]struct{}
+	activitySeen    []string
+	activityPrimed  bool
+	activityPolling bool
 	updateAvailable string
 	exitAction      ExitAction
 
-	snapshot gack.Snapshot
-	channels []gack.Conversation
-	channel  int
-	messages []gack.Message
-	message  int
+	snapshot            gack.Snapshot
+	channels            []gack.Conversation
+	channel             int
+	messages            []gack.Message
+	message             int
+	messageCursor       string
+	loadingMoreMessages bool
 
-	threadTS string
-	thread   []gack.Message
-	threadAt int
+	threadTS          string
+	thread            []gack.Message
+	threadAt          int
+	threadCursor      string
+	loadingMoreThread bool
+
+	conversationCache []string
+	conversationViews map[string]conversationViewState
 
 	activity   []gack.ActivityItem
 	activityAt int
@@ -122,12 +157,17 @@ type Model struct {
 
 	dialog *dialogState
 
-	dragFrom  int
-	dragAt    int
-	dragMoved bool
+	dragFrom       int
+	dragAt         int
+	dragMoved      bool
+	hoverPane      focus
+	hoverSidebarAt int
+	hoverMessage   int
+	hoverThread    int
 
 	visibleChannelStart int
 	channelRowStart     int
+	visibleSidebarHits  []sidebarHit
 }
 
 func New(backend gack.Backend, order []string, saveOrder func([]string) error) *Model {
@@ -165,18 +205,50 @@ func NewWithSidebar(backend gack.Backend, preferences config.SidebarPreferences,
 	progress := spinner.New()
 	progress.Spinner = spinner.Dot
 	progress.Style = selectedStyle
-	return &Model{
+	model := &Model{
 		backend: backend, saveSidebar: saveSidebar, saveState: &sidebarSaveState{},
 		order: append([]string(nil), preferences.ChannelOrder...), sidebarSort: preferences.Sort.Normalize(),
-		channel: -1, message: -1, threadAt: -1, activityAt: 0,
+		sidebarGroups: config.NormalizeGroups(preferences.Groups),
+		channel:       -1, message: -1, threadAt: -1, activityAt: 0,
 		focus: focusSidebar, searchInput: search, findInput: find,
 		composeInput: compose, spin: progress, dragFrom: -1, dragAt: -1,
+		hoverPane: focus(-1), hoverSidebarAt: -1, hoverMessage: -1, hoverThread: -1,
+		conversationViews: make(map[string]conversationViewState), knownActivity: make(map[string]struct{}),
 	}
+	model.compileSidebarGroups()
+	return model
+}
+
+func (m *Model) compileSidebarGroups() {
+	m.sidebarGroupRules = m.sidebarGroupRules[:0]
+	for _, group := range m.sidebarGroups {
+		pattern, err := regexp.Compile(group.Pattern)
+		if err != nil {
+			continue
+		}
+		m.sidebarGroupRules = append(m.sidebarGroupRules, sidebarGroupRule{name: group.Name, pattern: pattern})
+	}
+}
+
+func (m *Model) rememberActivity(item gack.ActivityItem) bool {
+	key := item.ChannelID + "\x00" + item.ID
+	if _, seen := m.knownActivity[key]; seen {
+		return false
+	}
+	m.knownActivity[key] = struct{}{}
+	m.activitySeen = append(m.activitySeen, key)
+	const seenLimit = 200
+	if len(m.activitySeen) > seenLimit {
+		oldest := m.activitySeen[0]
+		m.activitySeen = m.activitySeen[1:]
+		delete(m.knownActivity, oldest)
+	}
+	return true
 }
 
 func (m *Model) Init() tea.Cmd {
 	m.startConnecting()
-	commands := []tea.Cmd{m.spin.Tick, bootstrapCmd(m.backend)}
+	commands := []tea.Cmd{m.spin.Tick, bootstrapCmd(m.backend), scheduleActivityPoll(15 * time.Second)}
 	if m.checkUpdate != nil {
 		commands = append(commands, checkUpdateCmd(m.checkUpdate))
 	}
@@ -186,6 +258,10 @@ func (m *Model) Init() tea.Cmd {
 // SetUpdateCheck adds a bounded background version check. Errors are silent in
 // the TUI; the explicit `gack update --check` command reports diagnostics.
 func (m *Model) SetUpdateCheck(check func(context.Context) (string, error)) { m.checkUpdate = check }
+
+// SetNotifier connects background mention events to the host notification
+// service. Delivery remains an effect and never blocks the reducer/UI loop.
+func (m *Model) SetNotifier(send func(context.Context, string, string) error) { m.notify = send }
 
 // RequestedExit tells the command wrapper whether the user chose an in-place
 // login repair or update from a recovery/banner action.
@@ -285,7 +361,7 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.err = ""
 		if m.mode == viewActivity || m.mode == viewNotifications {
 			m.busy = "Refreshing activity…"
-			return m, activityCmd(m.backend)
+			return m, activityCmd(m.backend, false)
 		}
 		if channel := m.currentChannelID(); channel != "" {
 			m.busy = "Refreshing messages…"
@@ -359,6 +435,9 @@ func (m *Model) updateSidebar(key string) tea.Cmd {
 		m.sidebarSort = m.sidebarSort.Next()
 		m.sortChannels(m.sidebarSort)
 		return m.saveSidebarPreferences("Sidebar sort: " + m.sidebarSort.Label())
+	case "g":
+		m.status = "Regex groups · gack groups add NAME REGEX"
+		return nil
 	case "enter", "right", "l":
 		if selected == 0 {
 			return m.openActivity(true)
@@ -384,8 +463,14 @@ func (m *Model) updateConversation(key string) tea.Cmd {
 	}
 	switch key {
 	case "up", "k":
-		m.setFocusedMessage(max(0, selected-1))
+		if selected == 0 {
+			return m.loadMoreFocusedMessages()
+		}
+		m.setFocusedMessage(selected - 1)
 	case "down", "j":
+		if selected == len(messages)-1 && m.focus == focusThread {
+			return m.loadMoreFocusedMessages()
+		}
 		m.setFocusedMessage(min(len(messages)-1, selected+1))
 	case "home", "g":
 		m.setFocusedMessage(0)
@@ -587,11 +672,33 @@ func (m *Model) openChannel(index int) tea.Cmd {
 	if index < 0 || index >= len(m.channels) {
 		return nil
 	}
+	// Re-selecting the channel that is already on screen is navigation, not a
+	// network request. In particular, clicking the active sidebar row should
+	// only move focus; it must not blank the conversation or dismiss a thread.
+	if index == m.channel {
+		m.sidebarAt = index + 2
+		m.mode = viewConversation
+		m.focus = focusMessages
+		return nil
+	}
+	m.cacheCurrentConversation()
 	m.channel = index
 	m.sidebarAt = index + 2
+	if m.restoreConversation(m.channels[index].ID) {
+		m.mode = viewConversation
+		m.focus = focusMessages
+		m.busy = ""
+		m.err = ""
+		return nil
+	}
 	m.messages = nil
 	m.message = -1
+	m.messageCursor = ""
+	m.loadingMoreMessages = false
 	m.threadTS, m.thread = "", nil
+	m.threadAt = -1
+	m.threadCursor = ""
+	m.loadingMoreThread = false
 	m.mode = viewConversation
 	m.focus = focusMessages
 	m.busy = "Loading messages…"
@@ -600,11 +707,44 @@ func (m *Model) openChannel(index int) tea.Cmd {
 }
 
 func (m *Model) openThread(message gack.Message) tea.Cmd {
-	m.threadTS = message.TS
-	m.thread = nil
-	m.threadAt = -1
+	thread := firstNonEmpty(message.ThreadTS, message.TS)
+	if thread == "" {
+		m.status = "This item cannot have replies"
+		return nil
+	}
+	m.threadTS = thread
+	// Keep an immediate, useful pane on screen while Slack answers. A message
+	// without existing replies already has everything needed to start a thread,
+	// so do not make an invalid conversations.replies request for event-like
+	// rows that Slack exposes in conversation history.
+	m.thread = []gack.Message{message}
+	m.threadAt = 0
+	m.threadCursor = ""
+	m.loadingMoreThread = false
+	m.focus = focusThread
+	if message.ReplyCount == 0 && message.ThreadTS == "" {
+		m.status = "No replies yet · c starts the thread"
+		return nil
+	}
 	m.busy = "Loading thread…"
-	return threadCmd(m.backend, m.currentChannelID(), message.TS)
+	return threadCmd(m.backend, m.currentChannelID(), thread)
+}
+
+func (m *Model) loadMoreFocusedMessages() tea.Cmd {
+	if m.focus == focusThread {
+		if m.loadingMoreThread || m.threadCursor == "" || m.threadTS == "" {
+			return nil
+		}
+		m.loadingMoreThread = true
+		m.status = "Loading more replies…"
+		return moreThreadCmd(m.backend, m.currentChannelID(), m.threadTS, m.threadCursor)
+	}
+	if m.loadingMoreMessages || m.messageCursor == "" {
+		return nil
+	}
+	m.loadingMoreMessages = true
+	m.status = "Loading older messages…"
+	return moreMessagesCmd(m.backend, m.currentChannelID(), m.messageCursor)
 }
 
 func (m *Model) openActivity(notificationsOnly bool) tea.Cmd {
@@ -618,7 +758,7 @@ func (m *Model) openActivity(notificationsOnly bool) tea.Cmd {
 	m.focus = focusMessages
 	m.activityAt = 0
 	m.busy = "Loading activity…"
-	return activityCmd(m.backend)
+	return activityCmd(m.backend, false)
 }
 
 func (m *Model) openComposer(thread string) {
@@ -843,6 +983,62 @@ func (m *Model) currentChannelID() string {
 	return m.channels[m.channel].ID
 }
 
+func (m *Model) cacheCurrentConversation() {
+	id := m.currentChannelID()
+	if id == "" || len(m.messages) == 0 {
+		return
+	}
+	if m.conversationViews == nil {
+		m.conversationViews = make(map[string]conversationViewState)
+	}
+	m.conversationViews[id] = conversationViewState{
+		messages:      append([]gack.Message(nil), m.messages...),
+		message:       m.message,
+		messageCursor: m.messageCursor,
+		threadTS:      m.threadTS,
+		thread:        append([]gack.Message(nil), m.thread...),
+		threadAt:      m.threadAt,
+		threadCursor:  m.threadCursor,
+	}
+	for index, cached := range m.conversationCache {
+		if cached == id {
+			m.conversationCache = append(m.conversationCache[:index], m.conversationCache[index+1:]...)
+			break
+		}
+	}
+	m.conversationCache = append(m.conversationCache, id)
+	const cacheLimit = 8
+	if len(m.conversationCache) > cacheLimit {
+		evicted := m.conversationCache[0]
+		m.conversationCache = m.conversationCache[1:]
+		delete(m.conversationViews, evicted)
+	}
+}
+
+func (m *Model) restoreConversation(id string) bool {
+	state, ok := m.conversationViews[id]
+	if !ok {
+		return false
+	}
+	delete(m.conversationViews, id)
+	for index, cached := range m.conversationCache {
+		if cached == id {
+			m.conversationCache = append(m.conversationCache[:index], m.conversationCache[index+1:]...)
+			break
+		}
+	}
+	m.messages = append([]gack.Message(nil), state.messages...)
+	m.message = max(0, min(len(m.messages)-1, state.message))
+	m.messageCursor = state.messageCursor
+	m.loadingMoreMessages = false
+	m.threadTS = state.threadTS
+	m.thread = append([]gack.Message(nil), state.thread...)
+	m.threadAt = max(0, min(len(m.thread)-1, state.threadAt))
+	m.threadCursor = state.threadCursor
+	m.loadingMoreThread = false
+	return true
+}
+
 func (m *Model) filteredActivity() []gack.ActivityItem {
 	if m.mode != viewNotifications {
 		return m.activity
@@ -996,6 +1192,7 @@ func (m *Model) saveSidebarPreferences(notice string) tea.Cmd {
 	return saveSidebarCmd(m.saveState, m.saveSidebar, config.SidebarPreferences{
 		ChannelOrder: m.order,
 		Sort:         m.sidebarSort,
+		Groups:       append([]config.SidebarGroup(nil), m.sidebarGroups...),
 	}, notice)
 }
 
@@ -1013,34 +1210,88 @@ func (m *Model) channelOrder() []string {
 
 func (m *Model) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if m.dialog != nil || m.overlay != overlayNone || !m.ready {
+		m.clearHover()
 		return m, nil
 	}
+	m.updatePointer(msg)
 	if msg.Button == tea.MouseButtonWheelUp {
-		if m.mode == viewConversation && m.focus != focusSidebar {
-			messages, selected := m.focusedMessages()
-			if len(messages) > 0 {
-				m.setFocusedMessage(max(0, selected-2))
+		switch m.hoverPane {
+		case focusSidebar:
+			m.focus = focusSidebar
+			m.setSidebarSelection(max(0, m.sidebarSelection()-2))
+		case focusThread:
+			m.focus = focusThread
+			if m.hoverThread >= 0 {
+				m.threadAt = m.hoverThread
 			}
+			if m.threadAt == 0 {
+				return m, m.loadMoreFocusedMessages()
+			}
+			m.threadAt = max(0, m.threadAt-2)
+		case focusMessages:
+			m.focus = focusMessages
+			if m.hoverMessage >= 0 {
+				m.message = m.hoverMessage
+			}
+			if m.message == 0 {
+				return m, m.loadMoreFocusedMessages()
+			}
+			m.message = max(0, m.message-2)
 		}
 		return m, nil
 	}
 	if msg.Button == tea.MouseButtonWheelDown {
-		if m.mode == viewConversation && m.focus != focusSidebar {
-			messages, selected := m.focusedMessages()
-			if len(messages) > 0 {
-				m.setFocusedMessage(min(len(messages)-1, selected+2))
+		switch m.hoverPane {
+		case focusSidebar:
+			m.focus = focusSidebar
+			m.setSidebarSelection(min(len(m.channels)+1, m.sidebarSelection()+2))
+		case focusThread:
+			m.focus = focusThread
+			if m.hoverThread >= 0 {
+				m.threadAt = m.hoverThread
 			}
+			if m.threadAt == len(m.thread)-1 {
+				return m, m.loadMoreFocusedMessages()
+			}
+			m.threadAt = min(len(m.thread)-1, m.threadAt+2)
+		case focusMessages:
+			m.focus = focusMessages
+			if m.hoverMessage >= 0 {
+				m.message = m.hoverMessage
+			}
+			m.message = min(len(m.messages)-1, m.message+2)
 		}
 		return m, nil
 	}
-	channelIndex := m.visibleChannelStart + msg.Y - m.channelRowStart
+	channelIndex := m.channelIndexAtRow(msg.Y)
 	insideChannelList := msg.X >= 0 && msg.X < m.sidebarWidth() && channelIndex >= 0 && channelIndex < len(m.channels)
 	switch msg.Action {
 	case tea.MouseActionPress:
-		if msg.Button == tea.MouseButtonLeft && insideChannelList {
-			m.dragFrom, m.dragAt, m.dragMoved = channelIndex, channelIndex, false
+		if msg.Button != tea.MouseButtonLeft {
+			return m, nil
+		}
+		if insideChannelList {
 			m.focus = focusSidebar
 			m.sidebarAt = channelIndex + 2
+			m.dragFrom, m.dragAt, m.dragMoved = channelIndex, channelIndex, false
+			return m, nil
+		}
+		switch m.hoverPane {
+		case focusSidebar:
+			m.focus = focusSidebar
+			if m.hoverSidebarAt >= 0 {
+				m.sidebarAt = m.hoverSidebarAt
+			}
+		case focusMessages:
+			m.focus = focusMessages
+			if m.hoverMessage >= 0 {
+				m.message = m.hoverMessage
+			}
+		case focusThread:
+			m.focus = focusThread
+			if m.hoverThread >= 0 {
+				m.threadAt = m.hoverThread
+			}
 		}
 	case tea.MouseActionMotion:
 		if m.dragFrom >= 0 && insideChannelList && channelIndex != m.dragAt {
@@ -1060,8 +1311,93 @@ func (m *Model) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			}
 			return m, m.openChannel(at)
 		}
+		if msg.Button == tea.MouseButtonLeft && m.hoverPane == focusSidebar {
+			switch m.hoverSidebarAt {
+			case 0:
+				return m, m.openActivity(true)
+			case 1:
+				return m, m.openActivity(false)
+			}
+		}
 	}
 	return m, nil
+}
+
+func (m *Model) clearHover() {
+	m.hoverPane = focus(-1)
+	m.hoverSidebarAt = -1
+	m.hoverMessage = -1
+	m.hoverThread = -1
+}
+
+func (m *Model) updatePointer(msg tea.MouseMsg) {
+	m.clearHover()
+	const headerRows = 2
+	bodyHeight := max(3, m.height-headerRows-1)
+	bodyRow := msg.Y - headerRows
+	if msg.X < 0 || msg.X >= m.width || bodyRow < 0 || bodyRow >= bodyHeight {
+		return
+	}
+	sidebarWidth := m.sidebarWidth()
+	if sidebarWidth > 0 && msg.X < sidebarWidth {
+		m.hoverPane = focusSidebar
+		switch bodyRow {
+		case 3:
+			m.hoverSidebarAt = 0
+		case 4:
+			m.hoverSidebarAt = 1
+		default:
+			index := m.channelIndexAtRow(msg.Y)
+			if index >= 0 && index < len(m.channels) {
+				m.hoverSidebarAt = index + 2
+			}
+		}
+		return
+	}
+
+	available := m.width - sidebarWidth
+	if available <= 0 {
+		return
+	}
+	conversationX, conversationWidth := sidebarWidth, available
+	threadX, threadWidth := -1, 0
+	if m.mode == viewConversation && m.threadTS != "" && available >= 72 {
+		threadWidth = max(30, available*2/5)
+		conversationWidth = available - threadWidth
+		threadX = conversationX + conversationWidth
+	} else if m.mode == viewConversation && m.threadTS != "" && m.focus == focusThread {
+		threadX, threadWidth = sidebarWidth, available
+		conversationWidth = 0
+	}
+
+	contentRow := bodyRow - 2
+	contentHeight := max(1, bodyHeight-3)
+	switch {
+	case threadWidth > 0 && msg.X >= threadX:
+		m.hoverPane = focusThread
+		measure, _ := readingColumn(max(1, threadWidth-2), 72)
+		m.hoverThread = m.messageAtViewportRow(m.thread, m.threadAt, contentHeight, measure, contentRow)
+	case conversationWidth > 0 && msg.X >= conversationX:
+		m.hoverPane = focusMessages
+		if m.mode == viewConversation {
+			measure, _ := readingColumn(max(1, conversationWidth-2), 112)
+			m.hoverMessage = m.messageAtViewportRow(m.messages, m.message, contentHeight, measure, contentRow)
+		}
+	}
+}
+
+func (m *Model) channelIndexAtRow(y int) int {
+	for _, hit := range m.visibleSidebarHits {
+		if hit.y == y {
+			return hit.channelIndex
+		}
+	}
+	// Preserve deterministic behavior for embedders and tests that send mouse
+	// events before the first View call has established grouped hit regions.
+	if len(m.visibleSidebarHits) == 0 && m.channelRowStart > 0 {
+		return m.visibleChannelStart + y - m.channelRowStart
+	}
+	return -1
 }
 
 func (m *Model) applyReaction(result reactionResult) {
@@ -1151,6 +1487,65 @@ func appendBounded(messages []gack.Message, message gack.Message, limit int) []g
 		messages = messages[:limit-1]
 	}
 	return append(messages, message)
+}
+
+func prependUniqueMessages(target *[]gack.Message, incoming []gack.Message) int {
+	if len(incoming) == 0 {
+		return 0
+	}
+	seen := make(map[string]struct{}, len(*target))
+	for _, message := range *target {
+		seen[message.TS] = struct{}{}
+	}
+	unique := make([]gack.Message, 0, len(incoming))
+	for _, message := range incoming {
+		if _, exists := seen[message.TS]; exists {
+			continue
+		}
+		seen[message.TS] = struct{}{}
+		unique = append(unique, message)
+	}
+	*target = append(unique, *target...)
+	if len(*target) > retainedHistoryLimit {
+		*target = (*target)[:retainedHistoryLimit]
+	}
+	return len(unique)
+}
+
+func appendUniqueMessages(target *[]gack.Message, incoming []gack.Message) (added, dropped int) {
+	if len(incoming) == 0 {
+		return 0, 0
+	}
+	seen := make(map[string]struct{}, len(*target))
+	for _, message := range *target {
+		seen[message.TS] = struct{}{}
+	}
+	for _, message := range incoming {
+		if _, exists := seen[message.TS]; exists {
+			continue
+		}
+		seen[message.TS] = struct{}{}
+		*target = append(*target, message)
+		added++
+	}
+	if len(*target) > retainedHistoryLimit {
+		dropped = len(*target) - retainedHistoryLimit
+		copy(*target, (*target)[dropped:])
+		*target = (*target)[:retainedHistoryLimit]
+	}
+	return added, dropped
+}
+
+const retainedHistoryLimit = 200
+
+func historyLoadedNotice(count int, cursor, noun string) string {
+	if count == 0 && cursor == "" {
+		return "You’ve reached the beginning"
+	}
+	if count == 0 {
+		return "No new " + noun + " on that page"
+	}
+	return fmt.Sprintf("Loaded %d %s", count, noun)
 }
 
 func reactionIsMine(message gack.Message, emoji string) bool {

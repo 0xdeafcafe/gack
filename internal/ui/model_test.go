@@ -3,13 +3,16 @@ package ui
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/0xdeafcafe/gack/internal/config"
 	"github.com/0xdeafcafe/gack/internal/demo"
 	"github.com/0xdeafcafe/gack/internal/gack"
 )
@@ -106,6 +109,154 @@ func TestVirtualMessageRendererOnlyFormatsVisibleWindow(t *testing.T) {
 	rendered := model.virtualMessages(model.messages, model.message, 8, 48, true)
 	if lipgloss.Height(rendered) > 8 {
 		t.Fatalf("virtualized message list exceeded viewport: %d lines", lipgloss.Height(rendered))
+	}
+}
+
+func TestVirtualMessageWindowBackfillsAndGroupsWithoutBlankRows(t *testing.T) {
+	model := readyDemoModel(t, 120, 36)
+	now := time.Now()
+	messages := []gack.Message{
+		{TS: "1", UserID: "U1", Username: "Alex", Time: now, Text: strings.Repeat("long earlier message ", 80)},
+		{TS: "2", UserID: "U1", Username: "Alex", Time: now.Add(time.Minute), Text: "follow-up"},
+		{TS: "3", UserID: "U2", Username: "Maya", Time: now.Add(10 * time.Minute), Text: "latest"},
+	}
+	rendered := model.virtualMessages(messages, 2, 18, 48, true)
+	if got := lipgloss.Height(rendered); got != 18 {
+		t.Fatalf("backfilled window height = %d, want 18\n%s", got, ansi.Strip(rendered))
+	}
+	compact := []gack.Message{
+		{TS: "1", UserID: "U1", Username: "Alex", Time: now, Text: "one"},
+		{TS: "2", UserID: "U1", Username: "Alex", Time: now.Add(time.Minute), Text: "two"},
+	}
+	grouped := ansi.Strip(model.virtualMessages(compact, 0, 18, 48, true))
+	if strings.Count(grouped, "Alex") != 1 || !strings.Contains(grouped, "↳") || strings.Contains(grouped, "\n\n\n") {
+		t.Fatalf("message grouping is not compact:\n%s", grouped)
+	}
+}
+
+func TestUpKeyMovesConversationSelection(t *testing.T) {
+	model := readyDemoModel(t, 120, 36)
+	model.focus = focusMessages
+	model.message = len(model.messages) - 1
+	before := model.message
+	model.Update(tea.KeyMsg{Type: tea.KeyUp})
+	if model.message != before-1 {
+		t.Fatalf("up moved message %d → %d", before, model.message)
+	}
+}
+
+func TestOpeningThreadUsesRootAndSkipsEmptyThreadRequest(t *testing.T) {
+	model := readyDemoModel(t, 120, 36)
+	model.channel = 0
+
+	reply := gack.Message{TS: "reply", ThreadTS: "root", ReplyCount: 2, Text: "reply"}
+	command := model.openThread(reply)
+	if command == nil || model.threadTS != "root" || model.focus != focusThread {
+		t.Fatalf("reply opened with thread=%q focus=%d command=%v", model.threadTS, model.focus, command)
+	}
+
+	root := gack.Message{TS: "new-root", Text: "start a thread"}
+	command = model.openThread(root)
+	if command != nil || model.threadTS != "new-root" || len(model.thread) != 1 || model.focus != focusThread {
+		t.Fatalf("empty thread should open locally: thread=%q replies=%d focus=%d command=%v", model.threadTS, len(model.thread), model.focus, command)
+	}
+}
+
+func TestReselectingActiveChannelOnlyMovesFocus(t *testing.T) {
+	model := readyDemoModel(t, 120, 36)
+	model.threadTS = "root"
+	model.thread = []gack.Message{{TS: "root"}, {TS: "reply", ThreadTS: "root"}}
+	model.focus = focusSidebar
+	before := append([]gack.Message(nil), model.messages...)
+
+	if command := model.openChannel(model.channel); command != nil {
+		t.Fatal("active channel selection unexpectedly reloaded messages")
+	}
+	if model.focus != focusMessages || model.threadTS != "root" || len(model.thread) != 2 || !reflect.DeepEqual(model.messages, before) {
+		t.Fatalf("active channel selection discarded local state: focus=%d thread=%q replies=%d", model.focus, model.threadTS, len(model.thread))
+	}
+}
+
+func TestChannelHistoryCacheIsBoundedAndRestoresThread(t *testing.T) {
+	model := readyDemoModel(t, 120, 36)
+	model.threadTS = "root"
+	model.thread = []gack.Message{{TS: "root"}}
+	activeID := model.currentChannelID()
+	model.cacheCurrentConversation()
+	model.messages = nil
+	model.threadTS, model.thread = "", nil
+
+	if !model.restoreConversation(activeID) || len(model.messages) == 0 || model.threadTS != "root" || len(model.thread) != 1 {
+		t.Fatalf("cached view did not restore: messages=%d thread=%q replies=%d", len(model.messages), model.threadTS, len(model.thread))
+	}
+	for index := 0; index < 10; index++ {
+		model.channels = append(model.channels, gack.Conversation{ID: fmt.Sprintf("cache-%d", index), Name: "cache"})
+		model.channel = len(model.channels) - 1
+		model.messages = []gack.Message{{TS: fmt.Sprintf("%d", index)}}
+		model.cacheCurrentConversation()
+	}
+	if len(model.conversationViews) != 8 || len(model.conversationCache) != 8 {
+		t.Fatalf("cache grew to views=%d order=%d", len(model.conversationViews), len(model.conversationCache))
+	}
+}
+
+func TestPagedHistoryAdvancesIntoNewlyLoadedMessages(t *testing.T) {
+	model := readyDemoModel(t, 120, 36)
+	model.messages = []gack.Message{{TS: "3"}, {TS: "4"}}
+	model.message = 0
+	model.messageCursor = "next"
+	model.reduce(messagesResult{
+		channel: model.currentChannelID(), more: true, nextCursor: "",
+		messages: []gack.Message{{TS: "1"}, {TS: "2"}, {TS: "3"}},
+	})
+	if len(model.messages) != 4 || model.message != 1 || model.messages[model.message].TS != "2" || model.messageCursor != "" {
+		t.Fatalf("paged history = %#v selected=%d cursor=%q", model.messages, model.message, model.messageCursor)
+	}
+}
+
+func TestMouseHoverAndClicksIdentifyRealTargets(t *testing.T) {
+	model := readyDemoModel(t, 120, 36)
+	model.View() // establishes the virtualized sidebar row coordinates
+
+	model.updateMouse(tea.MouseMsg{X: 3, Y: 5, Action: tea.MouseActionMotion})
+	if model.hoverPane != focusSidebar || model.hoverSidebarAt != 0 || !strings.Contains(ansi.Strip(model.View()), "POINTER › Notifications") {
+		t.Fatalf("notification hover = pane %d row %d", model.hoverPane, model.hoverSidebarAt)
+	}
+
+	model.updateMouse(tea.MouseMsg{X: model.sidebarWidth() + 4, Y: 4, Action: tea.MouseActionMotion})
+	if model.hoverPane != focusMessages || model.hoverMessage < 0 {
+		t.Fatalf("conversation hover = pane %d message %d", model.hoverPane, model.hoverMessage)
+	}
+	hovered := model.hoverMessage
+	model.updateMouse(tea.MouseMsg{X: model.sidebarWidth() + 4, Y: 4, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	if model.focus != focusMessages || model.message != hovered {
+		t.Fatalf("conversation click = focus %d message %d, want %d", model.focus, model.message, hovered)
+	}
+}
+
+func TestRegexSidebarGroupsKeepChannelOrderWithinSections(t *testing.T) {
+	model := NewWithSidebar(demo.New(), config.SidebarPreferences{Groups: []config.SidebarGroup{
+		{Name: "Engineering", Pattern: `^(eng|dev)-`},
+		{Name: "Alerts", Pattern: `alerts?$`},
+	}}, nil)
+	model.channels = []gack.Conversation{
+		{ID: "1", Name: "eng-api"},
+		{ID: "2", Name: "random"},
+		{ID: "3", Name: "dev-tools"},
+		{ID: "4", Name: "prod-alerts"},
+	}
+	rows := model.sidebarDisplayRows()
+	var labels []string
+	var indexes []int
+	for _, row := range rows {
+		if row.channelIndex < 0 {
+			labels = append(labels, row.label)
+		} else {
+			indexes = append(indexes, row.channelIndex)
+		}
+	}
+	if !reflect.DeepEqual(labels, []string{"Engineering (2)", "Alerts (1)", "Other (1)"}) || !reflect.DeepEqual(indexes, []int{0, 2, 3, 1}) {
+		t.Fatalf("group rows labels=%v indexes=%v", labels, indexes)
 	}
 }
 

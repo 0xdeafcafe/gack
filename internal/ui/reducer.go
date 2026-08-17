@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"time"
+
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/0xdeafcafe/gack/internal/config"
@@ -40,25 +42,55 @@ func (m *Model) reduce(event applicationEvent) tea.Cmd {
 		if event.channel != m.currentChannelID() {
 			return nil
 		}
-		m.busy = ""
+		m.loadingMoreMessages = false
+		if !event.more {
+			m.busy = ""
+		}
 		if event.err != nil {
 			m.err = event.err.Error()
 			return nil
 		}
 		m.err = ""
-		m.messages = event.messages
-		m.message = len(m.messages) - 1
+		m.messageCursor = event.nextCursor
+		if event.more {
+			added := prependUniqueMessages(&m.messages, event.messages)
+			if added > 0 {
+				// The request was triggered by moving above row zero. Land on the
+				// nearest newly loaded message so one key press produces one move.
+				m.message = added - 1
+			}
+			m.status = historyLoadedNotice(added, m.messageCursor, "older messages")
+		} else {
+			m.messages = event.messages
+			m.message = len(m.messages) - 1
+		}
 	case threadResult:
 		if event.channel != m.currentChannelID() || event.thread != m.threadTS {
 			return nil
 		}
-		m.busy = ""
+		m.loadingMoreThread = false
+		if !event.more {
+			m.busy = ""
+		}
 		if event.err != nil {
 			m.err = event.err.Error()
 			return nil
 		}
-		m.thread = event.replies
-		m.threadAt = len(m.thread) - 1
+		m.threadCursor = event.nextCursor
+		if event.more {
+			oldLength := len(m.thread)
+			wasAtEnd := m.threadAt == oldLength-1
+			added, dropped := appendUniqueMessages(&m.thread, event.replies)
+			if wasAtEnd && added > 0 {
+				m.threadAt = min(len(m.thread)-1, oldLength-dropped)
+			} else {
+				m.threadAt = max(0, m.threadAt-dropped)
+			}
+			m.status = historyLoadedNotice(added, m.threadCursor, "replies")
+		} else {
+			m.thread = event.replies
+			m.threadAt = len(m.thread) - 1
+		}
 		m.focus = focusThread
 	case postResult:
 		m.busy = ""
@@ -98,13 +130,44 @@ func (m *Model) reduce(event applicationEvent) tea.Cmd {
 		m.searchRan = true
 		m.searchAt = 0
 	case activityResult:
-		m.busy = ""
+		m.activityPolling = false
+		if !event.background {
+			m.busy = ""
+		}
 		if event.err != nil {
-			m.err = event.err.Error()
+			if !event.background {
+				m.err = event.err.Error()
+			}
 			return nil
 		}
+		var notifications []tea.Cmd
+		for _, item := range event.items {
+			if !m.rememberActivity(item) {
+				continue
+			}
+			if event.background && m.activityPrimed && item.Unread && m.notify != nil && len(notifications) < 3 {
+				title := "gack · #" + item.ChannelName
+				if item.Actor != "" {
+					title += " · " + item.Actor
+				}
+				notifications = append(notifications, notificationCmd(m.notify, title, item.Text))
+			}
+		}
+		m.activityPrimed = true
 		m.activity = event.items
 		m.activityAt = min(m.activityAt, max(0, len(m.filteredActivity())-1))
+		return tea.Batch(notifications...)
+	case activityPollTick:
+		commands := []tea.Cmd{scheduleActivityPoll(30 * time.Second)}
+		if m.ready && !m.activityPolling {
+			m.activityPolling = true
+			commands = append(commands, activityCmd(m.backend, true))
+		}
+		return tea.Batch(commands...)
+	case notificationResult:
+		// Native notifications are best-effort. A missing desktop notifier must
+		// never turn a healthy Slack session into a persistent red error.
+		return nil
 	case interactionResult:
 		m.busy = ""
 		if event.err != nil {

@@ -14,18 +14,20 @@ type applicationEvent interface {
 	applicationEvent()
 }
 
-func (bootstrapResult) applicationEvent()   {}
-func (messagesResult) applicationEvent()    {}
-func (threadResult) applicationEvent()      {}
-func (postResult) applicationEvent()        {}
-func (editResult) applicationEvent()        {}
-func (searchResult) applicationEvent()      {}
-func (activityResult) applicationEvent()    {}
-func (interactionResult) applicationEvent() {}
-func (reactionResult) applicationEvent()    {}
-func (sidebarSaved) applicationEvent()      {}
-func (copiedResult) applicationEvent()      {}
-func (versionResult) applicationEvent()     {}
+func (bootstrapResult) applicationEvent()    {}
+func (messagesResult) applicationEvent()     {}
+func (threadResult) applicationEvent()       {}
+func (postResult) applicationEvent()         {}
+func (editResult) applicationEvent()         {}
+func (searchResult) applicationEvent()       {}
+func (activityResult) applicationEvent()     {}
+func (activityPollTick) applicationEvent()   {}
+func (notificationResult) applicationEvent() {}
+func (interactionResult) applicationEvent()  {}
+func (reactionResult) applicationEvent()     {}
+func (sidebarSaved) applicationEvent()       {}
+func (copiedResult) applicationEvent()       {}
+func (versionResult) applicationEvent()      {}
 
 // applicationEffect isolates a side effect from the reducer. Bubble Tea runs
 // the command outside Update and feeds the resulting event back into the same

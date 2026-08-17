@@ -48,7 +48,9 @@ In the demo, open `#platform`, select the Shipyard release message, and press `1
 | `a` / `n` | Open activity / unread notifications |
 | `Tab` | Move between the sidebar, conversation, and thread |
 | `s` (sidebar) | Cycle Manual, Alphabetical, and Attention sorting |
+| `g` (sidebar) | Show the local regex-grouping command |
 | `Shift+J` / `Shift+K` | Move a channel down / up |
+| mouse click / wheel | Focus panes, select rows, open navigation, and scroll locally |
 | mouse drag | Reorder channels |
 | `R` | Refresh the current view |
 | `?` | Show the in-app key guide |
@@ -56,6 +58,19 @@ In the demo, open `#platform`, select the Shipyard release message, and press `1
 Terminals generally do not send the macOS Command modifier to terminal programs. If you want a literal `Cmd+K`, add a terminal key mapping that sends `Ctrl+K` (hex `0x0b`); `gack` will open the same floating palette. The same idea maps `Cmd+Up` to `Ctrl+Up` for edit-last-message.
 
 Channel order is saved to `~/.config/gack/config.json` (or the platform-equivalent user config directory).
+
+### Group a large sidebar
+
+Slack does not expose a supported Web API for reading your custom desktop sidebar sections. Gack therefore supports small local regex rules; the first matching rule wins and unmatched conversations remain under **Other**:
+
+```sh
+gack groups add Engineering '^(eng|dev)-'
+gack groups add Alerts '(^alerts-|alerts$)'
+gack groups list
+gack groups remove Alerts
+```
+
+Rules create visual sections without duplicating channel data. Manual ordering still controls the order inside each section. Press `g` while the sidebar is focused to see the command reminder.
 
 ### Writing without fighting the editor
 
@@ -100,6 +115,8 @@ A bot token also works, but it only sees conversations the bot has joined and le
 ```sh
 GACK_MESSAGE_LIMIT=50 gack --live
 ```
+
+Gack requests older conversation pages when you reach the top of the loaded window and more replies when you reach the end of a long thread. Background mention checks feed native macOS/Linux notifications after an initial no-alert baseline; set `GACK_NO_NOTIFICATIONS=1` to disable them.
 
 ## Let an agent use gack
 
@@ -149,8 +166,8 @@ The bridge receives normalized Block Kit actions and view submissions and can re
 
 ## Kept lean on purpose
 
-- Message history is bounded: 15 live messages by default, 100 maximum.
-- There is no per-channel history cache; switching channels releases the previous window.
+- Slack history is fetched in 15-message pages by default; the in-memory window is capped at 200 messages.
+- The eight most recently visited conversations keep bounded local view state, including the open thread, so pane and channel navigation does not flash or reload unnecessarily.
 - Search results and locally posted messages are bounded.
 - Conversation and message panes only format rows that can be seen around the cursor.
 - Channel lists are windowed too, including mouse hit-testing.
@@ -167,13 +184,13 @@ GOMEMLIMIT=64MiB gack --live
 ## What is here today
 
 - Live channels, DMs, conversation history, posting/editing, threads, search, and reactions
-- Activity and notification views (mentions are derived from search; press `R` to refresh)
+- Activity and notification views (mentions are derived from search, refreshed quietly, and can produce native notifications)
 - Slack mrkdwn mentions, channels, links, common emoji, and Block Kit rendering
 - Interactive demo workflows and a live bridge protocol
-- Responsive narrow-terminal layout, actionable connection recovery, mouse wheel navigation, and persistent channel ordering
+- Responsive narrow-terminal layout, explicit pointer/focus states, clickable navigation/messages, pane-local mouse scrolling, and persistent channel ordering/grouping
 - Deterministic tests for the Slack transport, Block Kit parser, interaction workflow, and viewport dimensions
 
-Still intentionally missing: files, message deletion, huddles, canvases, custom emoji downloads, and a Socket Mode event stream. The live client refreshes on navigation or `R`; real-time events are the next obvious transport layer.
+Still intentionally missing: files, message deletion, huddles, canvases, custom emoji downloads, and a Socket Mode event stream. Background mentions currently use a bounded poll producer; Socket Mode is the next obvious real-time transport.
 
 ## Build it
 

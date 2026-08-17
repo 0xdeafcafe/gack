@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"github.com/0xdeafcafe/gack/internal/demo"
 	"github.com/0xdeafcafe/gack/internal/gack"
 	"github.com/0xdeafcafe/gack/internal/loginui"
+	"github.com/0xdeafcafe/gack/internal/notify"
 	"github.com/0xdeafcafe/gack/internal/selfupdate"
 	"github.com/0xdeafcafe/gack/internal/slack"
 	"github.com/0xdeafcafe/gack/internal/slackapp"
@@ -54,6 +56,12 @@ func main() {
 				os.Exit(1)
 			}
 			return
+		case "groups":
+			if err := runGroups(os.Args[2:], os.Stdout, os.Stderr); err != nil {
+				fmt.Fprintln(os.Stderr, "gack groups:", err)
+				os.Exit(1)
+			}
+			return
 		}
 	}
 
@@ -74,7 +82,7 @@ func main() {
 	liveMode := flag.Bool("live", false, "require a live Slack token")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Usage = func() {
-		fmt.Fprint(flag.CommandLine.Output(), "Usage: gack [--demo|--live]\n       gack manifest [--open]\n       gack login [--client-id ID] [--no-browser]\n       gack update [--check]\n       gack logout\n       gack api [--demo] <command> [arguments]\n\n")
+		fmt.Fprint(flag.CommandLine.Output(), "Usage: gack [--demo|--live]\n       gack manifest [--open]\n       gack login [--client-id ID] [--no-browser]\n       gack update [--check]\n       gack groups <list|add|remove|clear>\n       gack logout\n       gack api [--demo] <command> [arguments]\n\n")
 		fmt.Fprint(flag.CommandLine.Output(), "Open the terminal client, sign into a Slack workspace, or use the JSON agent API.\n\n")
 		flag.PrintDefaults()
 	}
@@ -138,16 +146,107 @@ func main() {
 	}
 }
 
+func runGroups(arguments []string, stdout, stderr io.Writer) error {
+	usage := func() {
+		fmt.Fprintln(stderr, "Usage:")
+		fmt.Fprintln(stderr, "  gack groups list")
+		fmt.Fprintln(stderr, "  gack groups add NAME REGEX")
+		fmt.Fprintln(stderr, "  gack groups remove NAME")
+		fmt.Fprintln(stderr, "  gack groups clear")
+		fmt.Fprintln(stderr, "First matching rule wins; unmatched conversations appear under Other.")
+	}
+	if len(arguments) == 0 || arguments[0] == "help" || arguments[0] == "--help" || arguments[0] == "-h" {
+		usage()
+		return nil
+	}
+	preferences, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("load preferences: %w", err)
+	}
+	switch arguments[0] {
+	case "list":
+		if len(arguments) != 1 {
+			return errors.New("list takes no arguments")
+		}
+		if len(preferences.SidebarGroups) == 0 {
+			fmt.Fprintln(stdout, "No sidebar groups. Add one with `gack groups add NAME REGEX`.")
+			return nil
+		}
+		for index, group := range preferences.SidebarGroups {
+			fmt.Fprintf(stdout, "%d. %s\t%s\n", index+1, group.Name, group.Pattern)
+		}
+		return nil
+	case "add":
+		if len(arguments) != 3 {
+			usage()
+			return errors.New("add needs a name and regex")
+		}
+		name, pattern := strings.TrimSpace(arguments[1]), strings.TrimSpace(arguments[2])
+		if name == "" || pattern == "" {
+			return errors.New("name and regex cannot be empty")
+		}
+		if _, err := regexp.Compile(pattern); err != nil {
+			return fmt.Errorf("invalid regex: %w", err)
+		}
+		for _, group := range preferences.SidebarGroups {
+			if strings.EqualFold(group.Name, name) {
+				return fmt.Errorf("group %q already exists", name)
+			}
+		}
+		preferences.SidebarGroups = append(preferences.SidebarGroups, config.SidebarGroup{Name: name, Pattern: pattern})
+		if err := config.Save(preferences); err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "Added sidebar group %q. It will appear the next time gack opens.\n", name)
+		return nil
+	case "remove":
+		if len(arguments) != 2 {
+			return errors.New("remove needs a group name")
+		}
+		for index, group := range preferences.SidebarGroups {
+			if !strings.EqualFold(group.Name, arguments[1]) {
+				continue
+			}
+			preferences.SidebarGroups = append(preferences.SidebarGroups[:index], preferences.SidebarGroups[index+1:]...)
+			if err := config.Save(preferences); err != nil {
+				return err
+			}
+			fmt.Fprintf(stdout, "Removed sidebar group %q.\n", group.Name)
+			return nil
+		}
+		return fmt.Errorf("group %q does not exist", arguments[1])
+	case "clear":
+		if len(arguments) != 1 {
+			return errors.New("clear takes no arguments")
+		}
+		preferences.SidebarGroups = nil
+		if err := config.Save(preferences); err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, "Cleared sidebar groups.")
+		return nil
+	default:
+		usage()
+		return fmt.Errorf("unknown command %q", arguments[0])
+	}
+}
+
 func runTUI(backend gack.Backend, preferences *config.Preferences) (ui.ExitAction, error) {
 	model := ui.NewWithSidebar(backend, config.SidebarPreferences{
 		ChannelOrder: preferences.ChannelOrder,
 		Sort:         preferences.SidebarSort,
+		Groups:       preferences.SidebarGroups,
 	}, func(sidebar config.SidebarPreferences) error {
 		preferences.ChannelOrder = sidebar.ChannelOrder
 		preferences.SidebarSort = sidebar.Sort
+		preferences.SidebarGroups = sidebar.Groups
 		return config.Save(*preferences)
 	})
 	currentVersion := buildVersion()
+	if !envBool("GACK_NO_NOTIFICATIONS") {
+		notifier := notify.Default()
+		model.SetNotifier(notifier.Send)
+	}
 	if !developmentBuild(currentVersion) && !envBool("GACK_NO_UPDATE_CHECK") {
 		checker := selfupdate.DefaultChecker()
 		model.SetUpdateCheck(func(ctx context.Context) (string, error) {
@@ -158,7 +257,7 @@ func runTUI(backend gack.Backend, preferences *config.Preferences) (ui.ExitActio
 			return result.Latest, nil
 		})
 	}
-	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseAllMotion())
 	final, err := program.Run()
 	if err != nil {
 		return ui.ExitNone, err

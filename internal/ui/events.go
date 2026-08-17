@@ -11,16 +11,20 @@ type bootstrapResult struct {
 }
 
 type messagesResult struct {
-	channel  string
-	messages []gack.Message
-	err      error
+	channel    string
+	messages   []gack.Message
+	nextCursor string
+	more       bool
+	err        error
 }
 
 type threadResult struct {
-	channel string
-	thread  string
-	replies []gack.Message
-	err     error
+	channel    string
+	thread     string
+	replies    []gack.Message
+	nextCursor string
+	more       bool
+	err        error
 }
 
 type postResult struct {
@@ -43,9 +47,14 @@ type searchResult struct {
 }
 
 type activityResult struct {
-	items []gack.ActivityItem
-	err   error
+	items      []gack.ActivityItem
+	background bool
+	err        error
 }
+
+type activityPollTick struct{}
+
+type notificationResult struct{ err error }
 
 type interactionResult struct {
 	result gack.InteractionResult

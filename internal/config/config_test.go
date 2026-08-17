@@ -41,3 +41,15 @@ func TestApplyOrderIsStableForUnknownAndDuplicateIDs(t *testing.T) {
 		t.Fatalf("ApplyOrder IDs = %v, want %v", ids, want)
 	}
 }
+
+func TestNormalizeGroupsTrimsAndDeduplicatesNames(t *testing.T) {
+	got := NormalizeGroups([]SidebarGroup{
+		{Name: " Engineering ", Pattern: " ^eng- "},
+		{Name: "engineering", Pattern: "duplicate"},
+		{Name: "", Pattern: ".*"},
+		{Name: "Other", Pattern: ""},
+	})
+	if len(got) != 1 || got[0].Name != "Engineering" || got[0].Pattern != "^eng-" {
+		t.Fatalf("NormalizeGroups() = %#v", got)
+	}
+}
