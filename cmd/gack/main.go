@@ -242,6 +242,9 @@ func runTUI(backend gack.Backend, preferences *config.Preferences) (ui.ExitActio
 		preferences.SidebarGroups = sidebar.Groups
 		return config.Save(*preferences)
 	})
+	model.SetURLOpener(func(_ context.Context, target string) error {
+		return auth.OpenBrowser(target)
+	})
 	currentVersion := buildVersion()
 	if !envBool("GACK_NO_NOTIFICATIONS") {
 		notifier := notify.Default()

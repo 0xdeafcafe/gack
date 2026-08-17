@@ -29,19 +29,20 @@ var (
 	ink        = lipgloss.AdaptiveColor{Light: "#2D1734", Dark: "#F4ECF7"}
 	selection  = lipgloss.AdaptiveColor{Light: "#E9D7EF", Dark: "#3B2942"}
 
-	headerStyle    = lipgloss.NewStyle().Bold(true).Foreground(white).Background(deepPurple)
-	locationStyle  = lipgloss.NewStyle().Foreground(ink).Background(soft)
-	footerStyle    = lipgloss.NewStyle().Foreground(muted)
-	activeBorder   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(purple)
-	inactiveBorder = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(muted)
-	floatingBorder = lipgloss.NewStyle().Border(lipgloss.DoubleBorder()).BorderForeground(purple)
-	selectedStyle  = lipgloss.NewStyle().Foreground(purple).Bold(true)
-	selectedRow    = lipgloss.NewStyle().Foreground(ink).Background(selection)
-	hoveredRow     = lipgloss.NewStyle().Foreground(ink).Background(soft)
-	selectedNav    = lipgloss.NewStyle().Foreground(white).Background(deepPurple).Bold(true)
-	dimStyle       = lipgloss.NewStyle().Foreground(muted)
-	errorStyle     = lipgloss.NewStyle().Foreground(danger).Bold(true)
-	successStyle   = lipgloss.NewStyle().Foreground(green)
+	headerStyle         = lipgloss.NewStyle().Bold(true).Foreground(white).Background(deepPurple)
+	locationStyle       = lipgloss.NewStyle().Foreground(ink).Background(soft)
+	footerStyle         = lipgloss.NewStyle().Foreground(muted)
+	activeBorder        = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(purple)
+	inactiveBorder      = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(muted)
+	floatingBorder      = lipgloss.NewStyle().Border(lipgloss.DoubleBorder()).BorderForeground(purple)
+	workspaceMenuBorder = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(purple).Background(soft)
+	selectedStyle       = lipgloss.NewStyle().Foreground(purple).Bold(true)
+	selectedRow         = lipgloss.NewStyle().Foreground(ink).Background(selection)
+	hoveredRow          = lipgloss.NewStyle().Foreground(ink).Background(soft)
+	selectedNav         = lipgloss.NewStyle().Foreground(white).Background(deepPurple).Bold(true)
+	dimStyle            = lipgloss.NewStyle().Foreground(muted)
+	errorStyle          = lipgloss.NewStyle().Foreground(danger).Bold(true)
+	successStyle        = lipgloss.NewStyle().Foreground(green)
 
 	mentionPattern = regexp.MustCompile(`<@([A-Z0-9_]+)>`)
 	channelPattern = regexp.MustCompile(`<#([A-Z0-9_]+)(\|([^>]+))?>`)
@@ -60,6 +61,8 @@ func (m *Model) View() string {
 	switch {
 	case m.dialog != nil:
 		body = m.renderDialog(m.renderBody(bodyHeight), bodyHeight)
+	case m.overlay == overlayWorkspace:
+		body = m.renderWorkspaceMenu(m.renderBody(bodyHeight), bodyHeight)
 	case m.overlay == overlayGlobalSearch:
 		body = m.renderSearch(m.renderBody(bodyHeight), bodyHeight)
 	case m.overlay == overlayAction || m.overlay == overlayReaction:
@@ -88,13 +91,7 @@ func (m *Model) renderHeader() string {
 			}
 		}
 	}
-	left := " GACK  /  " + m.snapshot.Team
-	if m.snapshot.Team == "" {
-		left = " GACK"
-	}
-	if m.width < 64 {
-		left = " GACK"
-	}
+	left := " GACK"
 	command := "Ctrl+K  commands "
 	if !m.ready {
 		command = "q  cancel "
@@ -108,11 +105,12 @@ func (m *Model) renderHeader() string {
 	brandLine := joinAcross(left, command, max(1, m.width))
 	brandLine = headerStyle.Width(max(0, m.width)).Render(brandLine)
 
-	focus := " YOU ARE HERE  ›  " + location + "  ›  " + m.focusPath()
+	workspace := m.workspaceControl()
+	focus := workspace + "  ›  " + location + "  ›  " + m.focusPath()
 	if pointer := m.pointerPath(); pointer != "" && m.width >= 84 {
 		focus = joinAcross(focus, "POINTER › "+pointer+" ", m.width)
 	}
-	locationLine := locationStyle.Width(max(0, m.width)).Render(truncate(focus, max(1, m.width)))
+	locationLine := locationStyle.Width(max(0, m.width)).Render(truncateANSI(focus, max(1, m.width)))
 	return brandLine + "\n" + locationLine
 }
 
@@ -130,6 +128,8 @@ func (m *Model) renderFooter() string {
 		value = m.spin.View() + " Connecting to Slack · q cancel"
 	case m.dialog != nil:
 		value = m.dialogFooter()
+	case m.overlay == overlayWorkspace:
+		value = "WORKSPACE · ↑/↓ choose · Enter open · 1/2 shortcut · Esc close"
 	case m.overlay == overlayGlobalSearch:
 		value = "COMMAND PALETTE · type to filter · ↑/↓ choose · Enter open · Esc close"
 	case m.overlay == overlayAction:
@@ -155,6 +155,30 @@ func (m *Model) renderFooter() string {
 		value = m.contextualHelp()
 	}
 	return style.Width(max(0, m.width)).Render(truncateANSI(value, max(1, m.width)))
+}
+
+func (m *Model) workspaceName() string {
+	if name := strings.TrimSpace(m.snapshot.Team); name != "" {
+		return name
+	}
+	return "Workspace"
+}
+
+func (m *Model) workspaceControl() string {
+	if !m.ready {
+		return dimStyle.Padding(0, 1).Render("Workspace")
+	}
+	maximum := max(9, min(30, m.width/3))
+	label := truncate(m.workspaceName(), max(1, maximum-4)) + "  ▾"
+	style := selectedRow.Bold(true).Padding(0, 1)
+	if m.overlay == overlayWorkspace || m.hoverWorkspace {
+		style = selectedNav.Padding(0, 1)
+	}
+	return style.Render(label)
+}
+
+func (m *Model) workspaceControlWidth() int {
+	return lipgloss.Width(m.workspaceControl())
 }
 
 func (m *Model) renderComposer() string {
@@ -836,6 +860,51 @@ func (m *Model) renderSearch(background string, height int) string {
 	return floatingOverlay(background, withShadow(box), m.width, height)
 }
 
+func (m *Model) workspaceMenuLayout(height int) (int, int, []string) {
+	// At compact widths the menu owns the body row completely; leaving a
+	// one-column strip of a dimmed pane beside it reads like a broken border.
+	width := max(8, min(48, m.width))
+	inner := max(1, width-4)
+	available := max(1, height-2)
+	itemStart := 0
+	lines := make([]string, 0, available)
+	if available >= 8 && inner >= 30 {
+		lines = append(lines,
+			joinAcross(selectedStyle.Render(m.workspaceName()), dimStyle.Render("WORKSPACE"), inner),
+			dimStyle.Render(workspaceMenuOptions[m.workspaceAt].description),
+			"",
+		)
+		itemStart = len(lines)
+	}
+	for index, option := range workspaceMenuOptions {
+		label := option.label
+		if option.url != "" {
+			label += "  ↗"
+		}
+		lines = append(lines, chooserLine(label, index == m.workspaceAt, inner))
+	}
+	if len(lines) < available {
+		lines = append(lines, "")
+	}
+	if len(lines) < available {
+		lines = append(lines, dimStyle.Render("↑/↓ choose · Enter open · Esc close"))
+	}
+	if len(lines) > available {
+		lines = lines[:available]
+	}
+	return width, itemStart, lines
+}
+
+func (m *Model) renderWorkspaceMenu(background string, height int) string {
+	width, _, lines := m.workspaceMenuLayout(height)
+	boxHeight := min(height, len(lines)+2)
+	box := workspaceMenuBorder.
+		Width(max(1, width-2)).
+		Height(max(1, boxHeight-2)).
+		Render(cropLines(strings.Join(lines, "\n"), max(1, boxHeight-2), max(1, width-4)))
+	return anchoredOverlay(background, box, m.width, height, 0, 0)
+}
+
 func (m *Model) renderPicker(background string, height int) string {
 	title := "Choose an action"
 	if m.overlay == overlayReaction {
@@ -948,6 +1017,7 @@ func (m *Model) renderHelp(background string, height int) string {
 	type shortcut struct{ key, description string }
 	shortcuts := []shortcut{
 		{"Ctrl+K", "Command palette"}, {"Ctrl+F", "Find in conversation"},
+		{"w", "Workspace menu"},
 		{"j / k", "Move selection"}, {"g / G", "First / last message"},
 		{"Enter / t", "Open thread"}, {"c", "Compose or reply"},
 		{"e / Ctrl+Up", "Edit own message"}, {"y", "Copy message"},
@@ -1009,6 +1079,8 @@ func (m *Model) focusPath() string {
 		return "Dialog"
 	}
 	switch m.overlay {
+	case overlayWorkspace:
+		return pickerPath("Workspace menu", m.workspaceAt, len(workspaceMenuOptions))
 	case overlayGlobalSearch:
 		count := m.searchItemCount()
 		if count > 0 {
@@ -1060,6 +1132,9 @@ func (m *Model) focusedPaneName() string {
 }
 
 func (m *Model) pointerPath() string {
+	if m.hoverWorkspace {
+		return m.workspaceName() + " workspace menu"
+	}
 	switch m.hoverPane {
 	case focusSidebar:
 		switch m.hoverSidebarAt {
@@ -1114,6 +1189,7 @@ func (m *Model) contextualHelp() string {
 		helpBinding("r", "react"),
 		helpBinding("i", "actions"),
 		helpBinding("Tab", "panes"),
+		helpBinding("w", "workspace"),
 		helpBinding("?", "all keys"),
 	}
 	switch {
@@ -1126,6 +1202,7 @@ func (m *Model) contextualHelp() string {
 			helpBinding("g", "groups"),
 			helpBinding("⇧J/K", "reorder"),
 			helpBinding("Tab", "next pane"),
+			helpBinding("w", "workspace"),
 			helpBinding("?", "all keys"),
 		}
 	case m.mode == viewActivity || m.mode == viewNotifications:
@@ -1135,6 +1212,7 @@ func (m *Model) contextualHelp() string {
 			helpBinding("Enter", "open"),
 			helpBinding("h", "sidebar"),
 			helpBinding("Tab", "next pane"),
+			helpBinding("w", "workspace"),
 			helpBinding("?", "all keys"),
 		}
 	case m.focus == focusThread:
@@ -1145,6 +1223,7 @@ func (m *Model) contextualHelp() string {
 			helpBinding("r", "react"),
 			helpBinding("i", "actions"),
 			helpBinding("h", "conversation"),
+			helpBinding("w", "workspace"),
 			helpBinding("?", "all keys"),
 		}
 	}
@@ -1322,13 +1401,23 @@ func withShadow(box string) string {
 // Keeping the panes visible around it makes the palette feel spatially anchored
 // instead of looking like navigation replaced the entire screen.
 func floatingOverlay(background, foreground string, width, height int) string {
-	background = cropLines(background, height, width)
 	foregroundLines := strings.Split(foreground, "\n")
 	foregroundWidth := min(width, lipgloss.Width(foreground))
 	foregroundHeight := min(height, len(foregroundLines))
 	x := max(0, (width-foregroundWidth)/2)
 	y := max(0, (height-foregroundHeight)/3)
+	return anchoredOverlay(background, foreground, width, height, x, y)
+}
 
+// anchoredOverlay composites a popover at a stable screen location. Workspace
+// navigation uses it to stay attached to the workspace control in the header.
+func anchoredOverlay(background, foreground string, width, height, x, y int) string {
+	background = cropLines(background, height, width)
+	foregroundLines := strings.Split(foreground, "\n")
+	foregroundWidth := min(width, lipgloss.Width(foreground))
+	foregroundHeight := min(height, len(foregroundLines))
+	x = max(0, min(x, width-foregroundWidth))
+	y = max(0, min(y, height-foregroundHeight))
 	backgroundLines := strings.Split(background, "\n")
 	for row := range backgroundLines {
 		plain := ansi.Strip(backgroundLines[row])

@@ -160,6 +160,22 @@ func TestOpeningThreadUsesRootAndSkipsEmptyThreadRequest(t *testing.T) {
 	if command != nil || model.threadTS != "new-root" || len(model.thread) != 1 || model.focus != focusThread {
 		t.Fatalf("empty thread should open locally: thread=%q replies=%d focus=%d command=%v", model.threadTS, len(model.thread), model.focus, command)
 	}
+	if model.status != "No replies yet · c starts the thread" {
+		t.Fatalf("empty thread status = %q", model.status)
+	}
+
+	command = model.openThread(reply)
+	if command == nil || model.status != "" {
+		t.Fatalf("populated thread retained stale status: command=%v status=%q", command != nil, model.status)
+	}
+	model.status = "stale thread status"
+	model.reduce(threadResult{
+		channel: model.currentChannelID(), thread: "root",
+		replies: []gack.Message{{TS: "root"}, {TS: "reply", ThreadTS: "root"}},
+	})
+	if model.status != "" || len(model.thread) != 2 {
+		t.Fatalf("loaded thread retained status=%q replies=%d", model.status, len(model.thread))
+	}
 }
 
 func TestReselectingActiveChannelOnlyMovesFocus(t *testing.T) {
@@ -357,7 +373,7 @@ func TestWideConversationUsesReadableSelectedMessageCard(t *testing.T) {
 	model := readyDemoModel(t, 196, 60)
 	model.focus = focusMessages
 	view := ansi.Strip(model.View())
-	for _, want := range []string{"YOU ARE HERE", "ACTIVE PANE", "SELECTED", "CONVERSATION"} {
+	for _, want := range []string{"Acme Engineering", "ACTIVE PANE", "SELECTED", "CONVERSATION"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("wide view is missing %q", want)
 		}

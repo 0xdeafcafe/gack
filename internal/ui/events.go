@@ -90,3 +90,9 @@ type versionResult struct {
 	latest string
 	err    error
 }
+
+type externalURLResult struct {
+	label string
+	url   string
+	err   error
+}

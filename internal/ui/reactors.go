@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/atotto/clipboard"
@@ -131,6 +132,15 @@ func scheduleActivityPoll(delay time.Duration) tea.Cmd {
 func notificationCmd(send func(context.Context, string, string) error, title, body string) tea.Cmd {
 	return (applicationEffect{timeout: 5 * time.Second, run: func(ctx context.Context) applicationEvent {
 		return notificationResult{err: send(ctx, title, body)}
+	}}).command()
+}
+
+func openExternalURLCmd(open func(context.Context, string) error, label, target string) tea.Cmd {
+	return (applicationEffect{timeout: 10 * time.Second, run: func(ctx context.Context) applicationEvent {
+		if open == nil {
+			return externalURLResult{label: label, url: target, err: errors.New("browser integration is unavailable")}
+		}
+		return externalURLResult{label: label, url: target, err: open(ctx, target)}
 	}}).command()
 }
 

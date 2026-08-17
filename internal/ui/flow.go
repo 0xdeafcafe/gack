@@ -29,6 +29,7 @@ func (reactionResult) applicationEvent()     {}
 func (sidebarSaved) applicationEvent()       {}
 func (copiedResult) applicationEvent()       {}
 func (versionResult) applicationEvent()      {}
+func (externalURLResult) applicationEvent()  {}
 
 // applicationEffect isolates a side effect from the reducer. Bubble Tea runs
 // the command outside Update and feeds the resulting event back into the same

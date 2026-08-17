@@ -129,6 +129,7 @@ func (m *Model) reduce(event applicationEvent) tea.Cmd {
 		} else {
 			m.thread = event.replies
 			m.threadAt = len(m.thread) - 1
+			m.status = ""
 		}
 		m.focus = focusThread
 	case postResult:
@@ -257,6 +258,14 @@ func (m *Model) reduce(event applicationEvent) tea.Cmd {
 			m.err = "Could not copy message: " + event.err.Error()
 		} else {
 			m.status = "Message copied"
+		}
+	case externalURLResult:
+		if event.err != nil {
+			m.status = ""
+			m.err = "Could not open " + event.label + ": " + event.err.Error()
+		} else {
+			m.err = ""
+			m.status = event.label + " opened in your browser"
 		}
 	}
 	return nil

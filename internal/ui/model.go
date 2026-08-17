@@ -42,6 +42,7 @@ type overlayMode int
 
 const (
 	overlayNone overlayMode = iota
+	overlayWorkspace
 	overlayGlobalSearch
 	overlayFind
 	overlayAction
@@ -52,6 +53,23 @@ const (
 type pickerOption struct {
 	label string
 	value string
+}
+
+type workspaceMenuOption struct {
+	label       string
+	description string
+	url         string
+}
+
+const (
+	slackManageAppsURL  = "https://slack.com/apps/manage"
+	slackCustomEmojiURL = "https://slack.com/customize/emoji"
+)
+
+var workspaceMenuOptions = []workspaceMenuOption{
+	{label: "Manage apps", description: "Review apps and integrations", url: slackManageAppsURL},
+	{label: "Add custom emoji", description: "Open workspace emoji tools", url: slackCustomEmojiURL},
+	{label: "Close", description: "Return to gack"},
 }
 
 type sidebarSaveState struct {
@@ -114,6 +132,7 @@ type Model struct {
 	usersErr         string
 	checkUpdate      func(context.Context) (string, error)
 	notify           func(context.Context, string, string) error
+	openURL          func(context.Context, string) error
 	knownActivity    map[string]struct{}
 	activitySeen     []string
 	activityPrimed   bool
@@ -154,6 +173,8 @@ type Model struct {
 	composeEditTS string
 	composeOrigin focus
 	overlay       overlayMode
+	workspaceAt   int
+	workspaceDown int
 
 	pickerElement *struct {
 		BlockID string
@@ -171,6 +192,7 @@ type Model struct {
 	hoverSidebarAt int
 	hoverMessage   int
 	hoverThread    int
+	hoverWorkspace bool
 
 	visibleChannelStart int
 	channelRowStart     int
@@ -219,7 +241,8 @@ func NewWithSidebar(backend gack.Backend, preferences config.SidebarPreferences,
 		channel:       -1, message: -1, threadAt: -1, activityAt: 0,
 		focus: focusSidebar, searchInput: search, findInput: find,
 		composeInput: compose, spin: progress, dragFrom: -1, dragAt: -1,
-		hoverPane: focus(-1), hoverSidebarAt: -1, hoverMessage: -1, hoverThread: -1,
+		workspaceDown: -1,
+		hoverPane:     focus(-1), hoverSidebarAt: -1, hoverMessage: -1, hoverThread: -1,
 		conversationViews: make(map[string]conversationViewState), knownActivity: make(map[string]struct{}),
 	}
 	model.compileSidebarGroups()
@@ -269,6 +292,10 @@ func (m *Model) SetUpdateCheck(check func(context.Context) (string, error)) { m.
 // SetNotifier connects background mention events to the host notification
 // service. Delivery remains an effect and never blocks the reducer/UI loop.
 func (m *Model) SetNotifier(send func(context.Context, string, string) error) { m.notify = send }
+
+// SetURLOpener connects workspace shortcuts to the host browser. Opening the
+// URL still happens in a Bubble Tea command, never while Update reduces input.
+func (m *Model) SetURLOpener(open func(context.Context, string) error) { m.openURL = open }
 
 // RequestedExit tells the command wrapper whether the user chose an in-place
 // login repair or update from a recovery/banner action.
@@ -334,6 +361,8 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.updateDialog(msg)
 	}
 	switch m.overlay {
+	case overlayWorkspace:
+		return m, m.updateWorkspaceMenu(msg)
 	case overlayGlobalSearch:
 		return m, m.updateSearch(msg)
 	case overlayFind:
@@ -356,6 +385,9 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.updateComposer(msg)
 	}
 	switch key {
+	case "w":
+		m.openWorkspaceMenu()
+		return m, nil
 	case "ctrl+f":
 		if m.mode == viewConversation {
 			m.overlay = overlayFind
@@ -409,6 +441,51 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.updateActivity(key)
 	}
 	return m, m.updateConversation(key)
+}
+
+func (m *Model) openWorkspaceMenu() {
+	m.overlay = overlayWorkspace
+	m.workspaceAt = 0
+	m.workspaceDown = -1
+}
+
+func (m *Model) closeWorkspaceMenu() {
+	m.overlay = overlayNone
+	m.workspaceAt = 0
+	m.workspaceDown = -1
+}
+
+func (m *Model) updateWorkspaceMenu(msg tea.KeyMsg) tea.Cmd {
+	switch msg.String() {
+	case "esc", "w":
+		m.closeWorkspaceMenu()
+	case "up", "k":
+		m.workspaceAt = max(0, m.workspaceAt-1)
+	case "down", "j":
+		m.workspaceAt = min(len(workspaceMenuOptions)-1, m.workspaceAt+1)
+	case "1":
+		m.workspaceAt = 0
+		return m.activateWorkspaceMenu()
+	case "2":
+		m.workspaceAt = 1
+		return m.activateWorkspaceMenu()
+	case "enter":
+		return m.activateWorkspaceMenu()
+	}
+	return nil
+}
+
+func (m *Model) activateWorkspaceMenu() tea.Cmd {
+	if m.workspaceAt < 0 || m.workspaceAt >= len(workspaceMenuOptions) {
+		return nil
+	}
+	option := workspaceMenuOptions[m.workspaceAt]
+	m.closeWorkspaceMenu()
+	if option.url == "" {
+		return nil
+	}
+	m.status = "Opening " + option.label + "…"
+	return openExternalURLCmd(m.openURL, option.label, option.url)
 }
 
 func (m *Model) startConnecting() {
@@ -760,6 +837,7 @@ func (m *Model) openThread(message gack.Message) tea.Cmd {
 	m.threadCursor = ""
 	m.loadingMoreThread = false
 	m.focus = focusThread
+	m.status = ""
 	if message.ReplyCount == 0 && message.ThreadTS == "" {
 		m.status = "No replies yet · c starts the thread"
 		return nil
@@ -1247,11 +1325,18 @@ func (m *Model) channelOrder() []string {
 }
 
 func (m *Model) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if m.overlay == overlayWorkspace && m.dialog == nil && m.ready {
+		return m.updateWorkspaceMenuMouse(msg)
+	}
 	if m.dialog != nil || m.overlay != overlayNone || !m.ready {
 		m.clearHover()
 		return m, nil
 	}
 	m.updatePointer(msg)
+	if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress && m.hoverWorkspace {
+		m.openWorkspaceMenu()
+		return m, nil
+	}
 	if msg.Button == tea.MouseButtonWheelUp {
 		switch m.hoverPane {
 		case focusSidebar:
@@ -1364,16 +1449,76 @@ func (m *Model) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func (m *Model) updateWorkspaceMenuMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	m.updatePointer(msg)
+	if msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress && m.hoverWorkspace {
+		m.closeWorkspaceMenu()
+		return m, nil
+	}
+	// The popover owns body-area pointer events. Do not describe the dimmed pane
+	// beneath it as the hovered target while a menu row is being chosen.
+	m.clearHover()
+	item := m.workspaceMenuItemAt(msg.X, msg.Y)
+	switch {
+	case msg.Button == tea.MouseButtonWheelUp:
+		m.workspaceAt = max(0, m.workspaceAt-1)
+	case msg.Button == tea.MouseButtonWheelDown:
+		m.workspaceAt = min(len(workspaceMenuOptions)-1, m.workspaceAt+1)
+	case msg.Action == tea.MouseActionMotion && item >= 0:
+		m.workspaceAt = item
+	case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress:
+		if item < 0 {
+			m.workspaceDown = -2
+			return m, nil
+		}
+		m.workspaceAt = item
+		m.workspaceDown = item
+	case msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionRelease:
+		pressed := m.workspaceDown
+		m.workspaceDown = -1
+		if pressed == -2 {
+			m.closeWorkspaceMenu()
+			return m, nil
+		}
+		if item >= 0 && item == pressed {
+			m.workspaceAt = item
+			return m, m.activateWorkspaceMenu()
+		}
+	}
+	return m, nil
+}
+
+func (m *Model) workspaceMenuItemAt(x, y int) int {
+	const menuX = 0
+	const headerRows = 2
+	bodyHeight := max(3, m.height-headerRows-1)
+	width, itemStart, _ := m.workspaceMenuLayout(bodyHeight)
+	if x < menuX || x >= menuX+width {
+		return -1
+	}
+	// One row belongs to the popover border before its content begins.
+	index := y - headerRows - 1 - itemStart
+	if index < 0 || index >= len(workspaceMenuOptions) {
+		return -1
+	}
+	return index
+}
+
 func (m *Model) clearHover() {
 	m.hoverPane = focus(-1)
 	m.hoverSidebarAt = -1
 	m.hoverMessage = -1
 	m.hoverThread = -1
+	m.hoverWorkspace = false
 }
 
 func (m *Model) updatePointer(msg tea.MouseMsg) {
 	m.clearHover()
 	const headerRows = 2
+	if m.ready && msg.Y == 1 && msg.X >= 0 && msg.X < m.workspaceControlWidth() {
+		m.hoverWorkspace = true
+		return
+	}
 	bodyHeight := max(3, m.height-headerRows-1)
 	bodyRow := msg.Y - headerRows
 	if msg.X < 0 || msg.X >= m.width || bodyRow < 0 || bodyRow >= bodyHeight {
