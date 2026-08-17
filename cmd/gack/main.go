@@ -19,6 +19,7 @@ import (
 	"github.com/0xdeafcafe/gack/internal/config"
 	"github.com/0xdeafcafe/gack/internal/demo"
 	"github.com/0xdeafcafe/gack/internal/gack"
+	"github.com/0xdeafcafe/gack/internal/loginui"
 	"github.com/0xdeafcafe/gack/internal/slack"
 	"github.com/0xdeafcafe/gack/internal/slackapp"
 	"github.com/0xdeafcafe/gack/internal/ui"
@@ -77,8 +78,12 @@ func main() {
 		os.Exit(2)
 	}
 
-	model := ui.New(backend, preferences.ChannelOrder, func(order []string) error {
-		preferences.ChannelOrder = order
+	model := ui.NewWithSidebar(backend, config.SidebarPreferences{
+		ChannelOrder: preferences.ChannelOrder,
+		Sort:         preferences.SidebarSort,
+	}, func(sidebar config.SidebarPreferences) error {
+		preferences.ChannelOrder = sidebar.ChannelOrder
+		preferences.SidebarSort = sidebar.Sort
 		return config.Save(preferences)
 	})
 	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
@@ -165,7 +170,7 @@ func newBackend(demoMode, requireLive bool) (gack.Backend, error) {
 	}
 	if token == "" {
 		if requireLive {
-			return nil, errors.New("no Slack login; run `gack login --client-id YOUR_SLACK_CLIENT_ID`")
+			return nil, errors.New("no Slack login; run `gack login`")
 		}
 		return demo.New(), nil
 	}
@@ -182,24 +187,39 @@ func runLogin(arguments []string, preferences *config.Preferences) {
 	noBrowser := flags.Bool("no-browser", false, "print the authorization URL without opening it")
 	redirectURI := flags.String("redirect-uri", firstNonEmpty(os.Getenv("GACK_SLACK_REDIRECT_URI"), auth.DefaultRedirectURI), "registered localhost OAuth redirect URI")
 	flags.Parse(arguments)
-	if *clientID == "" {
+	if *noBrowser && *clientID == "" {
 		fmt.Fprintln(os.Stderr, "gack login: pass --client-id from your Slack app’s Basic Information page")
-		fmt.Fprintln(os.Stderr, "Run `gack manifest --open` to create the app with the right PKCE settings and scopes.")
+		fmt.Fprintln(os.Stderr, "Run `gack login` in a terminal for guided setup, or `gack manifest --open` to create the app.")
 		os.Exit(2)
 	}
-	present := func(target string) error {
-		fmt.Println("Open this URL to sign in to Slack:")
-		fmt.Println(target)
-		if *noBrowser {
+	var credential auth.Credential
+	var err error
+	if *noBrowser {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		present := func(target string) error {
+			fmt.Println("Open this URL to sign in to Slack:")
+			fmt.Println(target)
 			return nil
 		}
-		return auth.OpenBrowser(target)
+		credential, err = (auth.OAuth{ClientID: *clientID, RedirectURI: *redirectURI, PresentURL: present}).Login(ctx)
+	} else {
+		wizardContext, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		credential, err = loginui.Run(wizardContext, loginui.Config{
+			ClientID: *clientID,
+			Login: func(ctx context.Context, selectedClientID string) (auth.Credential, error) {
+				authorizationContext, cancel := context.WithTimeout(ctx, 5*time.Minute)
+				defer cancel()
+				return (auth.OAuth{ClientID: selectedClientID, RedirectURI: *redirectURI}).Login(authorizationContext)
+			},
+		})
 	}
-	client := auth.OAuth{ClientID: *clientID, RedirectURI: *redirectURI, PresentURL: present}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	credential, err := client.Login(ctx)
 	if err != nil {
+		if errors.Is(err, loginui.ErrCanceled) {
+			fmt.Println("Slack sign-in canceled. Nothing was saved.")
+			return
+		}
 		fmt.Fprintln(os.Stderr, "gack login:", err)
 		os.Exit(1)
 	}
@@ -207,7 +227,7 @@ func runLogin(arguments []string, preferences *config.Preferences) {
 		fmt.Fprintln(os.Stderr, "gack login: could not save credential:", err)
 		os.Exit(1)
 	}
-	preferences.SlackClientID = *clientID
+	preferences.SlackClientID = credential.ClientID
 	if err := config.Save(*preferences); err != nil {
 		fmt.Fprintln(os.Stderr, "warning: signed in, but could not remember the client ID:", err)
 	}

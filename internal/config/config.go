@@ -1,15 +1,68 @@
 package config
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 )
 
+// SidebarSort controls how conversations are presented in the sidebar. The
+// manual order is kept independently so switching to a computed sort and back
+// never destroys a user's arrangement.
+type SidebarSort string
+
+const (
+	SidebarSortManual       SidebarSort = "manual"
+	SidebarSortAlphabetical SidebarSort = "alphabetical"
+	SidebarSortAttention    SidebarSort = "attention"
+)
+
+func (sort SidebarSort) Normalize() SidebarSort {
+	switch sort {
+	case SidebarSortManual, SidebarSortAlphabetical, SidebarSortAttention:
+		return sort
+	default:
+		return SidebarSortManual
+	}
+}
+
+func (sort SidebarSort) Next() SidebarSort {
+	switch sort.Normalize() {
+	case SidebarSortManual:
+		return SidebarSortAlphabetical
+	case SidebarSortAlphabetical:
+		return SidebarSortAttention
+	default:
+		return SidebarSortManual
+	}
+}
+
+func (sort SidebarSort) Label() string {
+	switch sort.Normalize() {
+	case SidebarSortAlphabetical:
+		return "Alphabetical"
+	case SidebarSortAttention:
+		return "Attention"
+	default:
+		return "Manual"
+	}
+}
+
 type Preferences struct {
-	ChannelOrder  []string `json:"channel_order,omitempty"`
-	SlackClientID string   `json:"slack_client_id,omitempty"`
+	ChannelOrder  []string    `json:"channel_order,omitempty"`
+	SidebarSort   SidebarSort `json:"sidebar_sort,omitempty"`
+	SlackClientID string      `json:"slack_client_id,omitempty"`
+}
+
+// SidebarPreferences is the small subset of Preferences owned by the TUI.
+// Keeping this value typed prevents the UI from having to know how the rest of
+// the application configuration is stored.
+type SidebarPreferences struct {
+	ChannelOrder []string
+	Sort         SidebarSort
 }
 
 func Path() (string, error) {
@@ -36,6 +89,7 @@ func Load() (Preferences, error) {
 	if err := json.Unmarshal(data, &preferences); err != nil {
 		return Preferences{}, err
 	}
+	preferences.SidebarSort = preferences.SidebarSort.Normalize()
 	return preferences, nil
 }
 
@@ -47,6 +101,7 @@ func Save(preferences Preferences) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
+	preferences.SidebarSort = preferences.SidebarSort.Normalize()
 	data, err := json.MarshalIndent(preferences, "", "  ")
 	if err != nil {
 		return err
@@ -73,28 +128,28 @@ func Save(preferences Preferences) error {
 
 func ApplyOrder[T any](items []T, ids func(T) string, order []string) []T {
 	if len(order) == 0 {
-		return items
+		return append([]T(nil), items...)
 	}
 	positions := make(map[string]int, len(order))
 	for i, id := range order {
-		positions[id] = i
-	}
-	result := append([]T(nil), items...)
-	for i := 1; i < len(result); i++ {
-		for j := i; j > 0; j-- {
-			left, leftOK := positions[ids(result[j-1])]
-			right, rightOK := positions[ids(result[j])]
-			if !leftOK {
-				left = len(order) + j - 1
-			}
-			if !rightOK {
-				right = len(order) + j
-			}
-			if left <= right {
-				break
-			}
-			result[j-1], result[j] = result[j], result[j-1]
+		if _, exists := positions[id]; !exists {
+			positions[id] = i
 		}
 	}
+	result := append([]T(nil), items...)
+	slices.SortStableFunc(result, func(left, right T) int {
+		leftPosition, leftKnown := positions[ids(left)]
+		rightPosition, rightKnown := positions[ids(right)]
+		switch {
+		case leftKnown && rightKnown:
+			return cmp.Compare(leftPosition, rightPosition)
+		case leftKnown:
+			return -1
+		case rightKnown:
+			return 1
+		default:
+			return 0
+		}
+	})
 	return result
 }

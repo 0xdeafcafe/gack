@@ -9,6 +9,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/charmbracelet/bubbles/help"
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
@@ -23,13 +25,19 @@ var (
 	warning    = lipgloss.AdaptiveColor{Light: "#9A3412", Dark: "#FFB86C"}
 	danger     = lipgloss.AdaptiveColor{Light: "#B91C1C", Dark: "#FF6B6B"}
 	green      = lipgloss.AdaptiveColor{Light: "#166534", Dark: "#50FA7B"}
+	white      = lipgloss.AdaptiveColor{Light: "#FFFFFF", Dark: "#FFFFFF"}
+	ink        = lipgloss.AdaptiveColor{Light: "#2D1734", Dark: "#F4ECF7"}
+	selection  = lipgloss.AdaptiveColor{Light: "#E9D7EF", Dark: "#3B2942"}
 
-	headerStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF")).Background(deepPurple)
+	headerStyle    = lipgloss.NewStyle().Bold(true).Foreground(white).Background(deepPurple)
+	locationStyle  = lipgloss.NewStyle().Foreground(ink).Background(soft)
 	footerStyle    = lipgloss.NewStyle().Foreground(muted)
 	activeBorder   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(purple)
 	inactiveBorder = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(muted)
 	floatingBorder = lipgloss.NewStyle().Border(lipgloss.DoubleBorder()).BorderForeground(purple)
 	selectedStyle  = lipgloss.NewStyle().Foreground(purple).Bold(true)
+	selectedRow    = lipgloss.NewStyle().Foreground(ink).Background(selection)
+	selectedNav    = lipgloss.NewStyle().Foreground(white).Background(deepPurple).Bold(true)
 	dimStyle       = lipgloss.NewStyle().Foreground(muted)
 	errorStyle     = lipgloss.NewStyle().Foreground(danger).Bold(true)
 	successStyle   = lipgloss.NewStyle().Foreground(green)
@@ -50,13 +58,13 @@ func (m *Model) View() string {
 	var body string
 	switch {
 	case m.dialog != nil:
-		body = m.renderDialog(bodyHeight)
+		body = m.renderDialog(m.renderBody(bodyHeight), bodyHeight)
 	case m.overlay == overlayGlobalSearch:
 		body = m.renderSearch(m.renderBody(bodyHeight), bodyHeight)
 	case m.overlay == overlayAction || m.overlay == overlayReaction:
-		body = m.renderPicker(bodyHeight)
+		body = m.renderPicker(m.renderBody(bodyHeight), bodyHeight)
 	case m.overlay == overlayHelp:
-		body = m.renderHelp(bodyHeight)
+		body = m.renderHelp(m.renderBody(bodyHeight), bodyHeight)
 	default:
 		body = m.renderBody(bodyHeight)
 	}
@@ -77,14 +85,20 @@ func (m *Model) renderHeader() string {
 			}
 		}
 	}
-	left := "GACK  " + m.snapshot.Team
+	left := " GACK  /  " + m.snapshot.Team
 	if m.snapshot.Team == "" {
-		left = "GACK"
+		left = " GACK"
 	}
-	right := location + "  ›  " + m.focusPath() + "    Ctrl+K"
-	gap := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right)-2)
-	line := left + strings.Repeat(" ", gap) + right
-	return headerStyle.Width(max(0, m.width)).Render(truncate(line, max(1, m.width)))
+	if m.width < 64 {
+		left = " GACK"
+	}
+	command := "Ctrl+K  commands "
+	brandLine := joinAcross(left, command, max(1, m.width))
+	brandLine = headerStyle.Width(max(0, m.width)).Render(brandLine)
+
+	focus := " YOU ARE HERE  ›  " + location + "  ›  " + m.focusPath()
+	locationLine := locationStyle.Width(max(0, m.width)).Render(truncate(focus, max(1, m.width)))
+	return brandLine + "\n" + locationLine
 }
 
 func (m *Model) renderFooter() string {
@@ -117,7 +131,7 @@ func (m *Model) renderFooter() string {
 	default:
 		value = m.contextualHelp()
 	}
-	return style.Width(max(0, m.width)).Render(truncate(value, max(1, m.width)))
+	return style.Width(max(0, m.width)).Render(truncateANSI(value, max(1, m.width)))
 }
 
 func (m *Model) renderComposer() string {
@@ -178,13 +192,13 @@ func (m *Model) renderBody(height int) string {
 }
 
 func (m *Model) sidebarWidth() int {
-	if m.width < 44 {
+	if m.width < 48 {
 		if m.focus == focusSidebar {
 			return m.width
 		}
 		return 0
 	}
-	return min(30, max(22, m.width/4))
+	return min(38, max(24, m.width/5))
 }
 
 func (m *Model) renderSidebar(width, height int) string {
@@ -198,13 +212,15 @@ func (m *Model) renderSidebar(width, height int) string {
 		}
 	}
 	lines = append(lines,
-		paneHeading("Sidebar", m.focus == focusSidebar, innerWidth),
-		m.sidebarLine("● Notifications", unreadActivity, m.sidebarAt == 0 && m.focus == focusSidebar, innerWidth),
-		m.sidebarLine("◷ Activity", len(m.activity), m.sidebarAt == 1 && m.focus == focusSidebar, innerWidth),
+		paneHeading("Workspace", m.focus == focusSidebar, innerWidth),
+		dimStyle.Render("  PRIORITY"),
+		m.sidebarLine("  ●  Notifications", unreadActivity, m.sidebarAt == 0 && m.focus == focusSidebar, m.mode == viewNotifications, innerWidth),
+		m.sidebarLine("  ◷  Activity", len(m.activity), m.sidebarAt == 1 && m.focus == focusSidebar, m.mode == viewActivity, innerWidth),
 		"",
-		dimStyle.Render("CHANNELS")+dimStyle.Render("  drag · ⇧J/K"),
 	)
-	available := max(0, innerHeight-len(lines))
+	// Reserve one row for the channel group heading so a long list still has a
+	// clear label and visible position within the virtualized window.
+	available := max(0, innerHeight-len(lines)-1)
 	cursor := m.channel
 	if m.sidebarAt >= 2 {
 		cursor = m.sidebarAt - 2
@@ -213,18 +229,30 @@ func (m *Model) renderSidebar(width, height int) string {
 	if start+available > len(m.channels) {
 		start = max(0, len(m.channels)-available)
 	}
+	end := min(len(m.channels), start+available)
+	rangeLabel := fmt.Sprintf("%d CHANNELS", len(m.channels))
+	if len(m.channels) > available && available > 0 {
+		rangeLabel = fmt.Sprintf("CHANNELS  %d–%d OF %d", start+1, end, len(m.channels))
+	}
+	sortLabel := "s: " + strings.ToUpper(m.sidebarSortLabel())
+	lines = append(lines, joinAcross(dimStyle.Render("  "+rangeLabel), dimStyle.Render(sortLabel), innerWidth))
 	m.visibleChannelStart = start
 	// Global terminal row: the app header, pane border, then the sidebar rows
 	// above the first channel. Keep this derived from the rendered structure so
 	// mouse dragging stays correct as the navigation chrome evolves.
-	m.channelRowStart = 1 + 1 + len(lines)
+	m.channelRowStart = lipgloss.Height(m.renderHeader()) + 1 + len(lines)
 	for index := start; index < len(m.channels) && len(lines) < innerHeight; index++ {
 		channel := m.channels[index]
 		label := channel.Label()
+		if channel.IsFavorite {
+			label = "★  " + label
+		} else {
+			label = "   " + label
+		}
 		if index == m.dragAt {
 			label = "↕ " + label
 		}
-		lines = append(lines, m.sidebarLine(label, channel.Unread, m.sidebarAt == index+2 && m.focus == focusSidebar, innerWidth))
+		lines = append(lines, m.sidebarLine(label, channel.Unread, m.sidebarAt == index+2 && m.focus == focusSidebar, index == m.channel && m.mode == viewConversation, innerWidth))
 	}
 	for len(lines) < innerHeight {
 		lines = append(lines, "")
@@ -236,16 +264,25 @@ func (m *Model) renderSidebar(width, height int) string {
 	return style.Width(innerWidth).Height(innerHeight).Render(cropLines(strings.Join(lines, "\n"), innerHeight, innerWidth))
 }
 
-func (m *Model) sidebarLine(label string, count int, selected bool, width int) string {
+func (m *Model) sidebarLine(label string, count int, selected, current bool, width int) string {
 	badge := ""
 	if count > 0 {
-		badge = fmt.Sprintf(" %d", count)
+		badge = fmt.Sprintf(" ● %d", count)
 	}
-	space := max(1, width-lipgloss.Width(label)-lipgloss.Width(badge)-1)
-	line := " " + truncate(label, max(1, width-lipgloss.Width(badge)-2)) + strings.Repeat(" ", space) + badge
+	prefix := "  "
+	if selected {
+		prefix = "› "
+	} else if current {
+		prefix = "▌ "
+	}
+	space := max(1, width-lipgloss.Width(prefix)-lipgloss.Width(label)-lipgloss.Width(badge))
+	line := prefix + truncate(label, max(1, width-lipgloss.Width(badge)-lipgloss.Width(prefix)-1)) + strings.Repeat(" ", space) + badge
 	line = truncate(line, width)
 	if selected {
-		return selectedStyle.Background(soft).Width(width).Render(line)
+		return selectedNav.Width(width).Render(line)
+	}
+	if current {
+		return selectedRow.Bold(true).Width(width).Render(line)
 	}
 	if count > 0 {
 		return lipgloss.NewStyle().Bold(true).Width(width).Render(line)
@@ -263,10 +300,12 @@ func (m *Model) renderConversation(width, height int) string {
 		}
 	}
 	contentHeight := max(1, height-3)
-	content := m.virtualMessages(m.messages, m.message, contentHeight, max(12, width-4), m.focus == focusMessages)
+	measure, inset := readingColumn(max(1, width-2), 94)
+	content := m.virtualMessages(m.messages, m.message, contentHeight, measure, m.focus == focusMessages)
 	if len(m.messages) == 0 && m.busy == "" {
 		content = dimStyle.Render("No messages in this conversation.")
 	}
+	content = insetLines(content, inset)
 	return m.renderPane(title, content, width, height, m.focus == focusMessages)
 }
 
@@ -275,10 +314,12 @@ func (m *Model) renderThread(width, height int) string {
 	if len(m.thread) > 0 {
 		title += dimStyle.Render(fmt.Sprintf("  %d replies", max(0, len(m.thread)-1)))
 	}
-	content := m.virtualMessages(m.thread, m.threadAt, max(1, height-3), max(12, width-4), m.focus == focusThread)
+	measure, inset := readingColumn(max(1, width-2), 72)
+	content := m.virtualMessages(m.thread, m.threadAt, max(1, height-3), measure, m.focus == focusThread)
 	if len(m.thread) == 0 {
 		content = dimStyle.Render("Loading thread…")
 	}
+	content = insetLines(content, inset)
 	return m.renderPane(title, content, width, height, m.focus == focusThread)
 }
 
@@ -298,6 +339,7 @@ func (m *Model) renderActivity(width, height int) string {
 	if start+visible > len(items) {
 		start = max(0, len(items)-visible)
 	}
+	measure, inset := readingColumn(max(1, width-2), 88)
 	var rendered []string
 	for index := start; index < len(items) && index < start+visible; index++ {
 		item := items[index]
@@ -310,11 +352,15 @@ func (m *Model) renderActivity(width, height int) string {
 			unread = " ●"
 		}
 		heading := fmt.Sprintf("%s%s in #%s%s", marker, activityIcon(item.Kind), item.ChannelName, unread)
-		bodyWidth := max(8, width-8)
+		bodyWidth := max(8, measure-4)
 		body := wrapText(formatSlackText(item.Text, m.snapshot.Users, m.channels), bodyWidth)
-		rendered = append(rendered, heading+"\n  "+item.Actor+dimStyle.Render(" · "+relativeTime(item.Time))+"\n  "+strings.Join(body, "\n  "))
+		itemView := heading + "\n  " + item.Actor + dimStyle.Render(" · "+relativeTime(item.Time)) + "\n  " + strings.Join(body, "\n  ")
+		if index == m.activityAt && m.focus != focusSidebar {
+			itemView = styleLines(itemView, selectedRow, measure)
+		}
+		rendered = append(rendered, itemView)
 	}
-	return m.renderPane(title, strings.Join(rendered, "\n\n"), width, height, m.focus != focusSidebar)
+	return m.renderPane(title, insetLines(strings.Join(rendered, "\n\n"), inset), width, height, m.focus != focusSidebar)
 }
 
 func (m *Model) renderPane(title, content string, width, height int, active bool) string {
@@ -384,7 +430,7 @@ func (m *Model) virtualMessages(messages []gack.Message, selected, height, width
 	for i, row := range rows {
 		parts[i] = row.value
 	}
-	return strings.Join(parts, "\n")
+	return strings.Join(parts, "\n\n")
 }
 
 func (m *Model) renderMessage(message gack.Message, width int, selected bool, index int) string {
@@ -402,6 +448,9 @@ func (m *Model) renderMessage(message gack.Message, width int, selected bool, in
 	heading := marker + lipgloss.NewStyle().Bold(true).Render(username) + dimStyle.Render("  "+message.Time.Format("15:04"))
 	if message.Edited {
 		heading += dimStyle.Render("  edited")
+	}
+	if selected {
+		heading = joinAcross(heading, selectedNav.Render(" SELECTED "), width)
 	}
 	bodyWidth := max(8, width-2)
 	lines := []string{heading}
@@ -471,11 +520,15 @@ func (m *Model) renderMessage(message gack.Message, width int, selected bool, in
 	if message.ReplyCount > 0 {
 		lines = append(lines, selectedStyle.Render(fmt.Sprintf("  ↳ %d replies  Enter to open", message.ReplyCount)))
 	}
-	return strings.Join(lines, "\n")
+	messageView := strings.Join(lines, "\n")
+	if selected {
+		messageView = styleLines(messageView, selectedRow, width)
+	}
+	return messageView
 }
 
 func (m *Model) renderSearch(background string, height int) string {
-	width := min(max(34, m.width-8), 82)
+	width := max(8, min(m.width-4, 82))
 	inner := max(1, width-4)
 	resultCount := m.searchItemCount()
 	position := "TYPE TO FILTER"
@@ -483,10 +536,10 @@ func (m *Model) renderSearch(background string, height int) string {
 		position = fmt.Sprintf("ITEM %d OF %d", min(m.searchAt+1, resultCount), resultCount)
 	}
 	lines := []string{
-		joinAcross(selectedStyle.Render("COMMAND PALETTE"), dimStyle.Render(position), inner),
+		joinAcross(selectedStyle.Render("⌕  COMMAND PALETTE"), dimStyle.Render(position), inner),
 		dimStyle.Render("Jump to a channel or search every message"),
 		"",
-		m.searchInput.View(),
+		lipgloss.NewStyle().Background(soft).Padding(0, 1).Width(max(1, inner-2)).Render(m.searchInput.View()),
 		"",
 	}
 	if m.busy == "Searching…" {
@@ -514,18 +567,18 @@ func (m *Model) renderSearch(background string, height int) string {
 		}
 	}
 	lines = append(lines, "", dimStyle.Render("↑/↓ choose · Enter open/search · Esc close · Ctrl+K toggle"))
-	boxHeight := min(height-2, max(10, len(lines)+2))
-	box := floatingBorder.Width(width - 2).Height(boxHeight - 2).Render(cropLines(strings.Join(lines, "\n"), boxHeight-2, width-4))
+	boxHeight := max(3, min(height-1, max(10, len(lines)+2)))
+	box := floatingBorder.Width(max(1, width-2)).Height(max(1, boxHeight-2)).Render(cropLines(strings.Join(lines, "\n"), max(1, boxHeight-2), max(1, width-4)))
 	return floatingOverlay(background, withShadow(box), m.width, height)
 }
 
-func (m *Model) renderPicker(height int) string {
+func (m *Model) renderPicker(background string, height int) string {
 	title := "Choose an action"
 	if m.overlay == overlayReaction {
 		title = "Add or remove a reaction"
 	}
-	width := min(54, max(30, m.width-8))
-	inner := width - 4
+	width := max(8, min(54, m.width-4))
+	inner := max(1, width-4)
 	position := "NO OPTIONS"
 	if len(m.pickerOptions) > 0 {
 		position = fmt.Sprintf("OPTION %d OF %d", min(m.pickerAt+1, len(m.pickerOptions)), len(m.pickerOptions))
@@ -535,22 +588,22 @@ func (m *Model) renderPicker(height int) string {
 		lines = append(lines, chooserLine(option.label, index == m.pickerAt, inner))
 	}
 	lines = append(lines, "", dimStyle.Render("↑/↓ choose · Enter apply · Esc close"))
-	boxHeight := min(height-2, len(lines)+2)
-	box := activeBorder.Width(width - 2).Height(boxHeight - 2).Render(cropLines(strings.Join(lines, "\n"), boxHeight-2, inner))
-	return lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, box)
+	boxHeight := max(3, min(height-1, len(lines)+2))
+	box := floatingBorder.Width(max(1, width-2)).Height(max(1, boxHeight-2)).Render(cropLines(strings.Join(lines, "\n"), max(1, boxHeight-2), inner))
+	return floatingOverlay(background, withShadow(box), m.width, height)
 }
 
-func (m *Model) renderDialog(height int) string {
+func (m *Model) renderDialog(background string, height int) string {
 	dialog := m.dialog
-	width := min(76, max(36, m.width-6))
-	inner := width - 4
+	width := max(8, min(76, m.width-4))
+	inner := max(1, width-4)
 	fieldAt, fieldCount := dialogFieldPosition(dialog)
 	position := "NO FIELDS"
 	if fieldCount > 0 {
 		position = fmt.Sprintf("FIELD %d OF %d", fieldAt, fieldCount)
 	}
 	lines := []string{
-		joinAcross(selectedStyle.Render("DIALOG · "+dialog.view.Title), dimStyle.Render(position), inner),
+		joinAcross(selectedStyle.Render("INTERACTIVE DIALOG · "+dialog.view.Title), dimStyle.Render(position), inner),
 		"",
 	}
 	for _, block := range dialog.view.Blocks {
@@ -576,7 +629,7 @@ func (m *Model) renderDialog(height int) string {
 			label += dimStyle.Render(" (optional)")
 		}
 		if index == dialog.at {
-			label += selectedStyle.Render("  ← FOCUSED")
+			label += selectedNav.Render(" EDITING THIS FIELD ")
 		}
 		lines = append(lines, marker+label)
 		switch {
@@ -620,33 +673,55 @@ func (m *Model) renderDialog(height int) string {
 		selectedStyle.Render("[Ctrl+S  "+submit+"]")+"  "+dimStyle.Render("[Esc  "+closeLabel+"]"),
 		dimStyle.Render("Tab moves fields · arrows choose · Space toggles"),
 	)
-	boxHeight := min(height-2, max(12, len(lines)+2))
-	content := cropLines(strings.Join(lines, "\n"), boxHeight-2, inner)
-	box := activeBorder.Width(width - 2).Height(boxHeight - 2).Render(content)
-	return lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, box)
+	boxHeight := max(3, min(height-1, max(12, len(lines)+2)))
+	content := cropLines(strings.Join(lines, "\n"), max(1, boxHeight-2), inner)
+	box := floatingBorder.Width(max(1, width-2)).Height(max(1, boxHeight-2)).Render(content)
+	return floatingOverlay(background, withShadow(box), m.width, height)
 }
 
-func (m *Model) renderHelp(height int) string {
-	width := min(74, max(36, m.width-6))
-	lines := []string{
-		lipgloss.NewStyle().Bold(true).Foreground(purple).Render("Keyboard & mouse"), "",
-		"Ctrl+K       Open the floating command palette",
-		"Ctrl+F       Find text in the current conversation/thread",
-		"j / k        Move down / up", "g / G        First / last message",
-		"Enter / t    Open a thread", "c            Compose or reply",
-		"e / Ctrl+Up   Edit selected / latest own message", "y            Copy selected message",
-		"r            Add/remove emoji reaction", "i or 1–9     Use Block Kit actions",
-		"a / n        Activity / unread notifications", "Tab          Move between panes",
-		"R            Refresh the current view",
-		"Shift+J/K    Reorder the selected channel", "Mouse drag   Reorder channels; wheel scrolls messages",
-		"Esc          Go back", "q            Quit", "",
-		dimStyle.Render("Want Cmd+K? Map it to Ctrl+K in your terminal profile."),
-		dimStyle.Render("Most terminal protocols do not send the macOS Command modifier to apps."), "",
-		dimStyle.Render("Press ? or Esc to close"),
+func (m *Model) renderHelp(background string, height int) string {
+	width := max(8, min(74, m.width-4))
+	type shortcut struct{ key, description string }
+	shortcuts := []shortcut{
+		{"Ctrl+K", "Command palette"}, {"Ctrl+F", "Find in conversation"},
+		{"j / k", "Move selection"}, {"g / G", "First / last message"},
+		{"Enter / t", "Open thread"}, {"c", "Compose or reply"},
+		{"e / Ctrl+Up", "Edit own message"}, {"y", "Copy message"},
+		{"r", "Toggle reaction"}, {"i or 1–9", "Block Kit actions"},
+		{"a / n", "Activity / unread"}, {"Tab", "Move between panes"},
+		{"s", "Sort sidebar"}, {"Shift+J/K", "Reorder channel"},
+		{"R", "Refresh view"}, {"Mouse drag", "Reorder channels"},
+		{"Enter (write)", "Insert newline"}, {"Ctrl+S", "Send / submit"},
+		{"Esc", "Back / cancel"}, {"q", "Quit"},
 	}
-	boxHeight := min(height-2, len(lines)+2)
-	box := activeBorder.Width(width - 2).Height(boxHeight - 2).Render(cropLines(strings.Join(lines, "\n"), boxHeight-2, width-4))
-	return lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, box)
+	lines := []string{lipgloss.NewStyle().Bold(true).Foreground(purple).Render("Keyboard & mouse"), ""}
+	innerWidth := max(1, width-4)
+	columns := 1
+	if innerWidth >= 60 {
+		columns = 2
+	}
+	rows := (len(shortcuts) + columns - 1) / columns
+	columnWidth := max(1, innerWidth/columns)
+	for row := 0; row < rows; row++ {
+		line := ""
+		for column := 0; column < columns; column++ {
+			index := row + column*rows
+			entry := ""
+			if index < len(shortcuts) {
+				keyCell := selectedStyle.Render(padRight(shortcuts[index].key, 14))
+				entry = truncateANSI(keyCell+shortcuts[index].description, columnWidth-1)
+			}
+			line += padRight(entry, columnWidth)
+		}
+		lines = append(lines, truncateANSI(line, innerWidth))
+	}
+	lines = append(lines, "",
+		dimStyle.Render("Cmd+K: map the chord to Ctrl+K in your terminal profile."),
+		dimStyle.Render("Press ? or Esc to close"),
+	)
+	boxHeight := max(3, min(height-1, len(lines)+2))
+	box := floatingBorder.Width(max(1, width-2)).Height(max(1, boxHeight-2)).Render(cropLines(strings.Join(lines, "\n"), max(1, boxHeight-2), max(1, width-4)))
+	return floatingOverlay(background, withShadow(box), m.width, height)
 }
 
 func (m *Model) focusPath() string {
@@ -733,16 +808,57 @@ func (m *Model) sidebarFocusLabel() string {
 }
 
 func (m *Model) contextualHelp() string {
+	context := "CONVERSATION"
+	bindings := []key.Binding{
+		helpBinding("↑/↓", "select"),
+		helpBinding("Enter", "thread"),
+		helpBinding("c", "write"),
+		helpBinding("r", "react"),
+		helpBinding("i", "actions"),
+		helpBinding("Tab", "panes"),
+		helpBinding("?", "all keys"),
+	}
 	switch {
 	case m.focus == focusSidebar:
-		return "SIDEBAR · j/k choose · Enter open · Shift+J/K reorder · Tab next pane · Ctrl+K palette"
+		context = "SIDEBAR"
+		bindings = []key.Binding{
+			helpBinding("↑/↓", "select"),
+			helpBinding("Enter", "open"),
+			helpBinding("s", "sort"),
+			helpBinding("⇧J/K", "reorder"),
+			helpBinding("Tab", "next pane"),
+			helpBinding("?", "all keys"),
+		}
 	case m.mode == viewActivity || m.mode == viewNotifications:
-		return strings.ToUpper(m.focusedPaneName()) + " · j/k choose · Enter open · h sidebar · Tab next pane"
+		context = strings.ToUpper(m.focusedPaneName())
+		bindings = []key.Binding{
+			helpBinding("↑/↓", "select"),
+			helpBinding("Enter", "open"),
+			helpBinding("h", "sidebar"),
+			helpBinding("Tab", "next pane"),
+			helpBinding("?", "all keys"),
+		}
 	case m.focus == focusThread:
-		return "THREAD · j/k move · c reply · r react · i interact · h conversation · Tab next pane"
-	default:
-		return "CONVERSATION · j/k move · Enter thread · c compose · r react · i interact · Tab next pane"
+		context = "THREAD"
+		bindings = []key.Binding{
+			helpBinding("↑/↓", "select"),
+			helpBinding("c", "reply"),
+			helpBinding("r", "react"),
+			helpBinding("i", "actions"),
+			helpBinding("h", "conversation"),
+			helpBinding("?", "all keys"),
+		}
 	}
+
+	badge := selectedNav.Render(" " + context + " ")
+	helper := help.New()
+	helper.Width = max(1, m.width-lipgloss.Width(badge)-2)
+	helper.ShortSeparator = "  ·  "
+	helper.Styles.ShortKey = selectedStyle
+	helper.Styles.ShortDesc = dimStyle
+	helper.Styles.ShortSeparator = dimStyle
+	helper.Styles.Ellipsis = dimStyle
+	return badge + "  " + helper.ShortHelpView(bindings)
 }
 
 func (m *Model) dialogFooter() string {
@@ -802,10 +918,51 @@ func paneHeading(title string, active bool, width int) string {
 	label := lipgloss.NewStyle().Bold(true).Render(title)
 	right := ""
 	if active {
-		marker = selectedStyle.Render("●")
-		right = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF")).Background(purple).Render(" FOCUS ")
+		marker = selectedStyle.Render("◆")
+		right = selectedNav.Render(" ACTIVE PANE ")
 	}
-	return joinAcross(marker+" "+label, right, width)
+	heading := joinAcross(marker+" "+label, right, width)
+	if active {
+		return selectedRow.Width(width).Render(heading)
+	}
+	return heading
+}
+
+func helpBinding(keyName, description string) key.Binding {
+	return key.NewBinding(key.WithKeys(keyName), key.WithHelp(keyName, description))
+}
+
+// readingColumn gives message text a comfortable maximum measure and places
+// it slightly in from the pane edge. The pane may span a cinema-wide terminal;
+// prose should not. The unused columns deliberately become breathing room.
+func readingColumn(available, maximum int) (measure, inset int) {
+	available = max(1, available)
+	inset = 1
+	if available > maximum+8 {
+		inset = min(12, max(2, (available-maximum)/5))
+	}
+	measure = max(8, min(maximum, available-inset))
+	return measure, inset
+}
+
+func insetLines(value string, inset int) string {
+	if value == "" || inset <= 0 {
+		return value
+	}
+	prefix := strings.Repeat(" ", inset)
+	lines := strings.Split(value, "\n")
+	for index := range lines {
+		lines[index] = prefix + lines[index]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func styleLines(value string, style lipgloss.Style, width int) string {
+	lines := strings.Split(value, "\n")
+	for index := range lines {
+		lines[index] = style.Width(width).Render(truncateANSI(lines[index], width))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func joinAcross(left, right string, width int) string {
@@ -875,7 +1032,7 @@ func chooserLine(label string, selected bool, width int) string {
 	}
 	line := truncate(prefix+label, width)
 	if selected {
-		return selectedStyle.Background(soft).Width(width).Render(line)
+		return selectedNav.Width(width).Render(line)
 	}
 	return line
 }

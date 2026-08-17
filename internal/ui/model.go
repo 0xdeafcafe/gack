@@ -1,11 +1,14 @@
 package ui
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/atotto/clipboard"
@@ -50,10 +53,17 @@ type pickerOption struct {
 	value string
 }
 
+type sidebarSaveState struct {
+	latest atomic.Uint64
+	mutex  sync.Mutex
+}
+
 type Model struct {
-	backend   gack.Backend
-	saveOrder func([]string) error
-	order     []string
+	backend     gack.Backend
+	saveSidebar func(config.SidebarPreferences) error
+	saveState   *sidebarSaveState
+	order       []string
+	sidebarSort config.SidebarSort
 
 	width  int
 	height int
@@ -107,6 +117,22 @@ type Model struct {
 }
 
 func New(backend gack.Backend, order []string, saveOrder func([]string) error) *Model {
+	var saveSidebar func(config.SidebarPreferences) error
+	if saveOrder != nil {
+		saveSidebar = func(preferences config.SidebarPreferences) error {
+			return saveOrder(preferences.ChannelOrder)
+		}
+	}
+	return NewWithSidebar(backend, config.SidebarPreferences{
+		ChannelOrder: order,
+		Sort:         config.SidebarSortManual,
+	}, saveSidebar)
+}
+
+// NewWithSidebar constructs a model with persistent ordering and sort
+// preferences. New remains available for embedders that only persist a manual
+// channel order.
+func NewWithSidebar(backend gack.Backend, preferences config.SidebarPreferences, saveSidebar func(config.SidebarPreferences) error) *Model {
 	search := textinput.New()
 	search.Prompt = "Search › "
 	search.Placeholder = "channels and messages"
@@ -123,7 +149,8 @@ func New(backend gack.Backend, order []string, saveOrder func([]string) error) *
 	compose.SetHeight(4)
 	compose.SetWidth(72)
 	return &Model{
-		backend: backend, saveOrder: saveOrder, order: append([]string(nil), order...),
+		backend: backend, saveSidebar: saveSidebar, saveState: &sidebarSaveState{},
+		order: append([]string(nil), preferences.ChannelOrder...), sidebarSort: preferences.Sort.Normalize(),
 		channel: -1, message: -1, threadAt: -1, activityAt: 0,
 		focus: focusSidebar, searchInput: search, findInput: find,
 		composeInput: compose, dragFrom: -1, dragAt: -1,
@@ -191,7 +218,11 @@ type reactionResult struct {
 	err     error
 }
 
-type orderSaved struct{ err error }
+type sidebarSaved struct {
+	revision uint64
+	notice   string
+	err      error
+}
 type copiedResult struct{ err error }
 
 func bootstrapCmd(backend gack.Backend) tea.Cmd {
@@ -279,12 +310,22 @@ func reactionCmd(backend gack.Backend, channel, thread, ts, emoji string, remove
 	}
 }
 
-func saveOrderCmd(save func([]string) error, order []string) tea.Cmd {
+func saveSidebarCmd(state *sidebarSaveState, save func(config.SidebarPreferences) error, preferences config.SidebarPreferences, notice string) tea.Cmd {
+	revision := state.latest.Add(1)
 	return func() tea.Msg {
-		if save == nil {
-			return orderSaved{}
+		state.mutex.Lock()
+		defer state.mutex.Unlock()
+		// Commands are run asynchronously. If a newer preference has already
+		// been issued, skipping this write prevents an older sort from winning
+		// a race and appearing again after restart.
+		if state.latest.Load() != revision {
+			return sidebarSaved{revision: revision}
 		}
-		return orderSaved{err: save(order)}
+		if save == nil {
+			return sidebarSaved{revision: revision, notice: notice}
+		}
+		preferences.ChannelOrder = append([]string(nil), preferences.ChannelOrder...)
+		return sidebarSaved{revision: revision, notice: notice, err: save(preferences)}
 	}
 }
 
@@ -306,7 +347,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.snapshot = msg.snapshot
+		// Always establish the manual order before applying a computed view.
+		// This also appends newly joined conversations without discarding the
+		// user's existing arrangement.
 		m.channels = config.ApplyOrder(msg.snapshot.Conversations, func(channel gack.Conversation) string { return channel.ID }, m.order)
+		m.order = m.channelOrder()
+		m.sortChannels(m.sidebarSort)
 		m.activity = append([]gack.ActivityItem(nil), msg.snapshot.Activity...)
 		m.ready = true
 		if len(m.channels) == 0 {
@@ -431,11 +477,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyReaction(msg)
 		m.status = ":" + msg.emoji + ": updated"
 		return m, nil
-	case orderSaved:
+	case sidebarSaved:
+		if m.saveState != nil && msg.revision != m.saveState.latest.Load() {
+			return m, nil
+		}
 		if msg.err != nil {
-			m.err = "Could not save channel order: " + msg.err.Error()
+			m.err = "Could not save sidebar preferences: " + msg.err.Error()
 		} else {
-			m.status = "Channel order saved"
+			m.status = msg.notice
 		}
 		return m, nil
 	case copiedResult:
@@ -549,14 +598,22 @@ func (m *Model) updateSidebar(key string) tea.Cmd {
 		selected = min(maximum, selected+1)
 	case "K":
 		if selected >= 2 && selected-2 > 0 {
+			m.beginManualReorder()
 			m.reorderChannel(selected-2, selected-3)
-			return saveOrderCmd(m.saveOrder, m.channelOrder())
+			m.order = m.channelOrder()
+			return m.saveSidebarPreferences("Manual channel order saved")
 		}
 	case "J":
 		if selected >= 2 && selected-2 < len(m.channels)-1 {
+			m.beginManualReorder()
 			m.reorderChannel(selected-2, selected-1)
-			return saveOrderCmd(m.saveOrder, m.channelOrder())
+			m.order = m.channelOrder()
+			return m.saveSidebarPreferences("Manual channel order saved")
 		}
+	case "s":
+		m.sidebarSort = m.sidebarSort.Next()
+		m.sortChannels(m.sidebarSort)
+		return m.saveSidebarPreferences("Sidebar sort: " + m.sidebarSort.Label())
 	case "enter", "right", "l":
 		if selected == 0 {
 			return m.openActivity(true)
@@ -1105,6 +1162,102 @@ func (m *Model) reorderChannel(from, to int) {
 	}
 }
 
+func (m *Model) beginManualReorder() {
+	if m.sidebarSort == config.SidebarSortManual {
+		return
+	}
+	// A reorder begins from exactly what is on screen. This makes Shift+J/K
+	// and dragging predictable even while a computed sort is active, while
+	// leaving the saved manual order untouched until the first actual move.
+	m.sidebarSort = config.SidebarSortManual
+	m.order = m.channelOrder()
+}
+
+func (m *Model) sortChannels(sort config.SidebarSort) {
+	sort = sort.Normalize()
+	selectedID := m.currentChannelID()
+	cursorID := ""
+	if m.sidebarAt >= 2 && m.sidebarAt-2 < len(m.channels) {
+		cursorID = m.channels[m.sidebarAt-2].ID
+	}
+
+	switch sort {
+	case config.SidebarSortAlphabetical:
+		slices.SortStableFunc(m.channels, compareChannelsAlphabetically)
+	case config.SidebarSortAttention:
+		slices.SortStableFunc(m.channels, compareChannelsByAttention)
+	default:
+		m.channels = config.ApplyOrder(m.channels, func(channel gack.Conversation) string { return channel.ID }, m.order)
+	}
+	m.sidebarSort = sort
+
+	for index := range m.channels {
+		if m.channels[index].ID == selectedID {
+			m.channel = index
+		}
+		if m.channels[index].ID == cursorID {
+			m.sidebarAt = index + 2
+		}
+	}
+}
+
+func compareChannelsAlphabetically(left, right gack.Conversation) int {
+	if order := cmp.Compare(channelSortName(left), channelSortName(right)); order != 0 {
+		return order
+	}
+	return cmp.Compare(left.ID, right.ID)
+}
+
+func compareChannelsByAttention(left, right gack.Conversation) int {
+	if order := cmp.Compare(channelAttention(right), channelAttention(left)); order != 0 {
+		return order
+	}
+	if order := cmp.Compare(right.Mentions, left.Mentions); order != 0 {
+		return order
+	}
+	if order := cmp.Compare(right.Unread, left.Unread); order != 0 {
+		return order
+	}
+	return compareChannelsAlphabetically(left, right)
+}
+
+func channelAttention(channel gack.Conversation) int {
+	if channel.Mentions > 0 {
+		return 3
+	}
+	if channel.Unread > 0 {
+		return 2
+	}
+	if channel.IsFavorite {
+		return 1
+	}
+	return 0
+}
+
+func channelSortName(channel gack.Conversation) string {
+	name := channel.Name
+	if channel.IsDM && channel.DisplayName != "" {
+		// DisplayName carries the visual @ sigil. It should not force every DM
+		// ahead of alphabetic channel names when the sidebar is sorted by name.
+		name = strings.TrimPrefix(channel.DisplayName, "@")
+	}
+	return strings.ToLower(name)
+}
+
+func (m *Model) saveSidebarPreferences(notice string) tea.Cmd {
+	if m.saveState == nil {
+		m.saveState = &sidebarSaveState{}
+	}
+	return saveSidebarCmd(m.saveState, m.saveSidebar, config.SidebarPreferences{
+		ChannelOrder: m.order,
+		Sort:         m.sidebarSort,
+	}, notice)
+}
+
+func (m *Model) sidebarSortLabel() string {
+	return m.sidebarSort.Label()
+}
+
 func (m *Model) channelOrder() []string {
 	result := make([]string, len(m.channels))
 	for i, channel := range m.channels {
@@ -1146,7 +1299,9 @@ func (m *Model) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 	case tea.MouseActionMotion:
 		if m.dragFrom >= 0 && insideChannelList && channelIndex != m.dragAt {
+			m.beginManualReorder()
 			m.reorderChannel(m.dragAt, channelIndex)
+			m.order = m.channelOrder()
 			m.dragAt = channelIndex
 			m.dragMoved = true
 		}
@@ -1156,7 +1311,7 @@ func (m *Model) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			at := m.dragAt
 			m.dragFrom, m.dragAt, m.dragMoved = -1, -1, false
 			if moved {
-				return m, saveOrderCmd(m.saveOrder, m.channelOrder())
+				return m, m.saveSidebarPreferences("Manual channel order saved")
 			}
 			return m, m.openChannel(at)
 		}
