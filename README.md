@@ -21,6 +21,15 @@ From a checkout:
 make run
 ```
 
+Installed builds check the tagged Go module release in the background at most once every six hours. When a newer version exists, the header shows `u update`; pressing `u` replaces the executable you launched and reopens gack. The same flow is available explicitly:
+
+```sh
+gack update --check
+gack update
+```
+
+The update is built through your installed Go toolchain, verified before replacement, and written atomically beside the current executable. Set `GACK_NO_UPDATE_CHECK=1` to disable the quiet background check.
+
 In the demo, open `#platform`, select the Shipyard release message, and press `1`. That walks through configure → validate → review → deploy without touching anything real.
 
 ## The useful keys
@@ -72,7 +81,7 @@ Run the guided setup:
 gack login
 ```
 
-The terminal walks through three explicit steps: open Slack’s pre-filled app creator, paste the numeric Client ID from **Basic Information**, then approve the workspace in your browser. It shows which control is focused, waits visibly for browser approval, and lets you retry or edit the Client ID without exposing a token.
+The terminal walks through three explicit steps: open Slack’s pre-filled app creator, paste the numeric Client ID from **Basic Information**, then approve the workspace in your browser. It shows which control is focused, waits visibly for browser approval, and lets you retry or edit the Client ID without exposing a token. Successful login continues straight into the workspace in the same process.
 
 If you already have the Client ID, skip straight to confirmation:
 
@@ -80,7 +89,7 @@ If you already have the Client ID, skip straight to confirmation:
 gack login --client-id '123456789.123456789'
 ```
 
-During sign-in, gack opens Slack in your browser, waits on a localhost callback, and exchanges the result with PKCE—there is no client secret in the binary. On macOS, the resulting user token lives in your login Keychain. Run `gack logout` to remove it. The Client ID is not secret and is remembered in the normal preferences file for future logins. After setup, run `gack`.
+During sign-in, gack opens Slack in your browser, waits on a localhost callback, and exchanges the result with PKCE—there is no client secret in the binary. On macOS, the resulting user token lives in your login Keychain. Run `gack logout` to remove it. The Client ID is not secret and is remembered in the normal preferences file for future logins. Starting plain `gack` while signed out opens this wizard automatically and then continues into Slack.
 
 `gack manifest` prints the same reusable YAML, and `gack manifest --open` opens Slack’s pre-filled creator directly when you would rather handle the steps yourself. The checked-in copy remains available as [`slack-manifest.example.yaml`](slack-manifest.example.yaml).
 
@@ -146,6 +155,7 @@ The bridge receives normalized Block Kit actions and view submissions and can re
 - Conversation and message panes only format rows that can be seen around the cursor.
 - Channel lists are windowed too, including mouse hit-testing.
 - Sidebar sort modes retain one manual order and only derive alternate views; they do not duplicate channel data.
+- Workspace bootstrap asks Slack only for conversations you joined, avoiding workspace-wide channel scans.
 - Network calls have deadlines, response size limits, and one rate-limit-aware retry.
 
 If you want a hard runtime ceiling as well, Go understands `GOMEMLIMIT`:
@@ -160,7 +170,7 @@ GOMEMLIMIT=64MiB gack --live
 - Activity and notification views (mentions are derived from search; press `R` to refresh)
 - Slack mrkdwn mentions, channels, links, common emoji, and Block Kit rendering
 - Interactive demo workflows and a live bridge protocol
-- Responsive narrow-terminal layout, mouse wheel navigation, and persistent channel ordering
+- Responsive narrow-terminal layout, actionable connection recovery, mouse wheel navigation, and persistent channel ordering
 - Deterministic tests for the Slack transport, Block Kit parser, interaction workflow, and viewport dimensions
 
 Still intentionally missing: files, message deletion, huddles, canvases, custom emoji downloads, and a Socket Mode event stream. The live client refreshes on navigation or `R`; real-time events are the next obvious transport layer.
