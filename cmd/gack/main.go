@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -20,6 +21,7 @@ import (
 	"github.com/0xdeafcafe/gack/internal/demo"
 	"github.com/0xdeafcafe/gack/internal/gack"
 	"github.com/0xdeafcafe/gack/internal/loginui"
+	"github.com/0xdeafcafe/gack/internal/selfupdate"
 	"github.com/0xdeafcafe/gack/internal/slack"
 	"github.com/0xdeafcafe/gack/internal/slackapp"
 	"github.com/0xdeafcafe/gack/internal/ui"
@@ -46,6 +48,12 @@ func main() {
 				os.Exit(1)
 			}
 			return
+		case "update":
+			if err := runUpdate(os.Args[2:], os.Stdout, os.Stderr, selfupdate.DefaultChecker(), selfupdate.Installer{}); err != nil {
+				fmt.Fprintln(os.Stderr, "gack update:", err)
+				os.Exit(1)
+			}
+			return
 		}
 	}
 
@@ -54,15 +62,19 @@ func main() {
 		fmt.Fprintln(os.Stderr, "warning: could not load preferences:", err)
 	}
 	if len(os.Args) > 1 && os.Args[1] == "login" {
-		runLogin(os.Args[2:], &preferences)
-		return
+		if !runLogin(os.Args[2:], &preferences) {
+			return
+		}
+		// Successful interactive login continues into the workspace in this
+		// process. Remove the subcommand before parsing the app flags below.
+		os.Args = []string{os.Args[0]}
 	}
 
 	demoMode := flag.Bool("demo", false, "run with built-in data even when SLACK_TOKEN is set")
 	liveMode := flag.Bool("live", false, "require a live Slack token")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Usage = func() {
-		fmt.Fprint(flag.CommandLine.Output(), "Usage: gack [--demo|--live]\n       gack manifest [--open]\n       gack login [--client-id ID] [--no-browser]\n       gack logout\n       gack api [--demo] <command> [arguments]\n\n")
+		fmt.Fprint(flag.CommandLine.Output(), "Usage: gack [--demo|--live]\n       gack manifest [--open]\n       gack login [--client-id ID] [--no-browser]\n       gack update [--check]\n       gack logout\n       gack api [--demo] <command> [arguments]\n\n")
 		fmt.Fprint(flag.CommandLine.Output(), "Open the terminal client, sign into a Slack workspace, or use the JSON agent API.\n\n")
 		flag.PrintDefaults()
 	}
@@ -71,26 +83,90 @@ func main() {
 		fmt.Println("gack " + buildVersion())
 		return
 	}
+	if *demoMode && *liveMode {
+		fmt.Fprintln(os.Stderr, "gack: --demo and --live cannot be used together")
+		os.Exit(2)
+	}
 
-	backend, err := newBackend(*demoMode, *liveMode)
+	backend, err := newBackend(*demoMode)
+	if errors.Is(err, auth.ErrNotFound) && !*demoMode {
+		err = loginInPlace(&preferences)
+		if errors.Is(err, loginui.ErrCanceled) {
+			return
+		}
+		if err == nil {
+			backend, err = newBackend(false)
+		}
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gack:", err)
 		os.Exit(2)
 	}
 
+	for {
+		action, runErr := runTUI(backend, &preferences)
+		if runErr != nil {
+			fmt.Fprintln(os.Stderr, "gack:", runErr)
+			os.Exit(1)
+		}
+		switch action {
+		case ui.ExitLogin:
+			if err := loginInPlace(&preferences); err != nil {
+				if errors.Is(err, loginui.ErrCanceled) {
+					return
+				}
+				fmt.Fprintln(os.Stderr, "gack login:", err)
+				os.Exit(1)
+			}
+			backend, err = newBackend(false)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "gack:", err)
+				os.Exit(1)
+			}
+		case ui.ExitUpdate:
+			if err := runUpdate(nil, os.Stdout, os.Stderr, selfupdate.DefaultChecker(), selfupdate.Installer{}); err != nil {
+				fmt.Fprintln(os.Stderr, "gack update:", err)
+				os.Exit(1)
+			}
+			if err := restartSelf(os.Args[1:]); err != nil {
+				fmt.Fprintln(os.Stderr, "gack: updated, but could not reopen:", err)
+			}
+			return
+		default:
+			return
+		}
+	}
+}
+
+func runTUI(backend gack.Backend, preferences *config.Preferences) (ui.ExitAction, error) {
 	model := ui.NewWithSidebar(backend, config.SidebarPreferences{
 		ChannelOrder: preferences.ChannelOrder,
 		Sort:         preferences.SidebarSort,
 	}, func(sidebar config.SidebarPreferences) error {
 		preferences.ChannelOrder = sidebar.ChannelOrder
 		preferences.SidebarSort = sidebar.Sort
-		return config.Save(preferences)
+		return config.Save(*preferences)
 	})
-	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
-	if _, err := program.Run(); err != nil {
-		fmt.Fprintln(os.Stderr, "gack:", err)
-		os.Exit(1)
+	currentVersion := buildVersion()
+	if !developmentBuild(currentVersion) && !envBool("GACK_NO_UPDATE_CHECK") {
+		checker := selfupdate.DefaultChecker()
+		model.SetUpdateCheck(func(ctx context.Context) (string, error) {
+			result, err := checker.Check(ctx, currentVersion, false)
+			if err != nil || !result.UpdateAvailable {
+				return "", err
+			}
+			return result.Latest, nil
+		})
 	}
+	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	final, err := program.Run()
+	if err != nil {
+		return ui.ExitNone, err
+	}
+	if result, ok := final.(*ui.Model); ok {
+		return result.RequestedExit(), nil
+	}
+	return ui.ExitNone, nil
 }
 
 func runAgentAPI(arguments []string) {
@@ -102,7 +178,7 @@ func runAgentAPI(arguments []string) {
 	if len(arguments) == 0 || arguments[0] == "help" || arguments[0] == "--help" || arguments[0] == "-h" {
 		demoMode = true // Help never needs credentials or a network connection.
 	}
-	backend, err := newBackend(demoMode, !demoMode)
+	backend, err := newBackend(demoMode)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "{\"ok\":false,\"command\":\"\",\"error\":{\"code\":\"backend_unavailable\",\"message\":%q}}\n", err.Error())
 		os.Exit(agentcli.ExitError)
@@ -145,7 +221,7 @@ func runManifest(arguments []string, stdout, stderr io.Writer, openBrowser func(
 	return nil
 }
 
-func newBackend(demoMode, requireLive bool) (gack.Backend, error) {
+func newBackend(demoMode bool) (gack.Backend, error) {
 	if demoMode {
 		return demo.New(), nil
 	}
@@ -169,10 +245,7 @@ func newBackend(demoMode, requireLive bool) (gack.Backend, error) {
 		}
 	}
 	if token == "" {
-		if requireLive {
-			return nil, errors.New("no Slack login; run `gack login`")
-		}
-		return demo.New(), nil
+		return nil, fmt.Errorf("no Slack login: %w", auth.ErrNotFound)
 	}
 	var bridge slack.InteractionBridge
 	if endpoint := os.Getenv("GACK_INTERACTION_URL"); endpoint != "" {
@@ -181,7 +254,7 @@ func newBackend(demoMode, requireLive bool) (gack.Backend, error) {
 	return slack.New(slack.Config{Token: token, Bridge: bridge, MessageLimit: envInt("GACK_MESSAGE_LIMIT", 15)})
 }
 
-func runLogin(arguments []string, preferences *config.Preferences) {
+func runLogin(arguments []string, preferences *config.Preferences) bool {
 	flags := flag.NewFlagSet("gack login", flag.ExitOnError)
 	clientID := flags.String("client-id", firstNonEmpty(os.Getenv("GACK_SLACK_CLIENT_ID"), preferences.SlackClientID), "Slack app client ID")
 	noBrowser := flags.Bool("no-browser", false, "print the authorization URL without opening it")
@@ -218,7 +291,7 @@ func runLogin(arguments []string, preferences *config.Preferences) {
 	if err != nil {
 		if errors.Is(err, loginui.ErrCanceled) {
 			fmt.Println("Slack sign-in canceled. Nothing was saved.")
-			return
+			return false
 		}
 		fmt.Fprintln(os.Stderr, "gack login:", err)
 		os.Exit(1)
@@ -232,7 +305,101 @@ func runLogin(arguments []string, preferences *config.Preferences) {
 		fmt.Fprintln(os.Stderr, "warning: signed in, but could not remember the client ID:", err)
 	}
 	workspace := firstNonEmpty(credential.TeamName, credential.TeamID, "Slack")
-	fmt.Println("Signed in to " + workspace + ". Run `gack` to open it.")
+	fmt.Println("Signed in to " + workspace + ". Opening it now…")
+	return true
+}
+
+func loginInPlace(preferences *config.Preferences) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	credential, err := loginui.Run(ctx, loginui.Config{
+		ClientID: firstNonEmpty(os.Getenv("GACK_SLACK_CLIENT_ID"), preferences.SlackClientID),
+		Login: func(ctx context.Context, clientID string) (auth.Credential, error) {
+			authorizationContext, stop := context.WithTimeout(ctx, 5*time.Minute)
+			defer stop()
+			redirectURI := firstNonEmpty(os.Getenv("GACK_SLACK_REDIRECT_URI"), auth.DefaultRedirectURI)
+			return (auth.OAuth{ClientID: clientID, RedirectURI: redirectURI}).Login(authorizationContext)
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if err := auth.DefaultStore().Save(credential); err != nil {
+		return fmt.Errorf("save Slack login: %w", err)
+	}
+	preferences.SlackClientID = credential.ClientID
+	if err := config.Save(*preferences); err != nil {
+		fmt.Fprintln(os.Stderr, "warning: signed in, but could not remember the client ID:", err)
+	}
+	return nil
+}
+
+func runUpdate(arguments []string, stdout, stderr io.Writer, checker selfupdate.Checker, installer selfupdate.Installer) error {
+	flags := flag.NewFlagSet("gack update", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	checkOnly := flags.Bool("check", false, "check the latest tagged version without installing it")
+	flags.Usage = func() {
+		fmt.Fprintln(stderr, "Usage: gack update [--check]")
+		fmt.Fprintln(stderr, "Check for a tagged release and replace this gack executable in place.")
+		flags.PrintDefaults()
+	}
+	if err := flags.Parse(arguments); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	current := buildVersion()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	result, err := checker.Check(ctx, current, true)
+	cancel()
+	if err != nil {
+		return err
+	}
+	if *checkOnly {
+		if developmentBuild(current) {
+			fmt.Fprintf(stdout, "This is a development build; the latest tagged release is %s.\n", result.Latest)
+		} else if result.UpdateAvailable {
+			fmt.Fprintf(stdout, "gack %s is available (you have %s). Run `gack update`.\n", result.Latest, current)
+		} else {
+			fmt.Fprintf(stdout, "gack %s is up to date.\n", current)
+		}
+		return nil
+	}
+	if developmentBuild(current) {
+		return fmt.Errorf("development builds are not replaced automatically; install %s@%s", selfupdate.CommandPath, result.Latest)
+	}
+	if !result.UpdateAvailable {
+		fmt.Fprintf(stdout, "gack %s is already up to date.\n", current)
+		return nil
+	}
+	fmt.Fprintf(stdout, "Updating gack %s → %s…\n", current, result.Latest)
+	installer.Stdout = stdout
+	installer.Stderr = stderr
+	updateContext, stopUpdate := context.WithTimeout(context.Background(), 10*time.Minute)
+	err = installer.Install(updateContext, result.Latest)
+	stopUpdate()
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "Updated gack in place to %s.\n", result.Latest)
+	return nil
+}
+
+func restartSelf(arguments []string) error {
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	command := exec.Command(executable, arguments...)
+	command.Stdin = os.Stdin
+	command.Stdout = os.Stdout
+	command.Stderr = os.Stderr
+	return command.Run()
+}
+
+func developmentBuild(value string) bool {
+	return value == "dev" || value == "(devel)" || strings.Contains(value, "+dirty")
 }
 
 func runLogout() {
