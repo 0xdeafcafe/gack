@@ -28,7 +28,7 @@ func TestClientBootstrapMessagesSearchAndReaction(t *testing.T) {
 		case "users.list":
 			writeJSON(writer, `{"ok":true,"members":[{"id":"U1","name":"alex","profile":{"display_name":"Alex"}},{"id":"U2","name":"maya","profile":{"real_name":"Maya"}}]}`)
 		case "conversations.list":
-			writeJSON(writer, `{"ok":true,"channels":[{"id":"C1","name":"general","is_member":true,"topic":{"value":"Hello"}},{"id":"D1","user":"U2","is_im":true,"unread_count_display":2}]}`)
+			writeJSON(writer, `{"ok":true,"channels":[{"id":"C1","name":"general","is_member":true,"topic":{"value":"Hello"}},{"id":"D1","user":"U2","is_im":true,"unread_count_display":2},{"id":"C1","name":"general","is_member":true}]}`)
 		case "conversations.history":
 			writeJSON(writer, `{"ok":true,"messages":[
           {"type":"message","ts":"200.000002","user":"U2","text":"newer"},
@@ -54,7 +54,7 @@ func TestClientBootstrapMessagesSearchAndReaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.Team != "Acme" || snapshot.Self.DisplayName() != "Alex" || snapshot.Conversations[1].Label() != "@Maya" {
+	if snapshot.Team != "Acme" || snapshot.Self.DisplayName() != "Alex" || len(snapshot.Conversations) != 2 || snapshot.Conversations[1].Label() != "@Maya" {
 		t.Fatalf("bad snapshot: %#v", snapshot)
 	}
 	messages, err := client.Messages(context.Background(), "C1")

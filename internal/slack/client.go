@@ -178,6 +178,7 @@ func (c *Client) loadUsers(ctx context.Context) (map[string]gack.User, error) {
 
 func (c *Client) loadConversations(ctx context.Context, users map[string]gack.User) ([]gack.Conversation, error) {
 	var result []gack.Conversation
+	seen := make(map[string]struct{}, c.channelLimit)
 	cursor := ""
 	for len(result) < c.channelLimit {
 		var response conversationsResponse
@@ -195,6 +196,13 @@ func (c *Client) loadConversations(ctx context.Context, users map[string]gack.Us
 			if source.IsArchived || (!source.IsMember && !source.IsIM) {
 				continue
 			}
+			// A conversation can occasionally be repeated across cursor pages while
+			// membership is changing. Never turn that transport quirk into duplicate
+			// sidebar rows.
+			if _, exists := seen[source.ID]; exists {
+				continue
+			}
+			seen[source.ID] = struct{}{}
 			name := source.Name
 			display := ""
 			if source.IsIM {
