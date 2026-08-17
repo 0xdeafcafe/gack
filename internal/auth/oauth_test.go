@@ -406,29 +406,32 @@ func TestCallbackPageEscapesContent(t *testing.T) {
 }
 
 func TestCallbackPageRendersAuthStates(t *testing.T) {
-	success := callbackPage("Authorization received", "Return to gack.", true)
+	success := callbackPage("You’re all set", "Slack and Gack are connected.", true)
 	for _, want := range []string{
-		"GACK / SLACK AUTH",
-		"COMPLETE",
-		`aria-label="Status: complete"`,
+		"gack",
+		"/ SLACK AUTH",
+		"CONNECTED",
+		`aria-label="Status: connected"`,
 		`role="status"`,
-		"Authorization received",
-		"Return to your terminal",
-		"Gack is finishing sign-in there.",
-		"Safe to close this tab",
+		"Nice, that worked",
+		"You’re all set",
+		"Head back to your terminal",
+		"Gack is finishing the last little bit for you.",
+		"You can close this tab",
 	} {
 		if !strings.Contains(success, want) {
 			t.Errorf("success page missing %q", want)
 		}
 	}
 
-	failure := callbackPage("Couldn’t sign in", "state did not match", false)
+	failure := callbackPage("That didn’t quite work", "state did not match", false)
 	for _, want := range []string{
-		"ACTION REQUIRED",
-		`aria-label="Status: action required"`,
+		"LET’S TRY AGAIN",
+		`aria-label="Status: sign-in needs attention"`,
 		`role="alert"`,
-		"Couldn’t sign in",
-		"Return to your terminal and try again",
+		"Almost there",
+		"That didn’t quite work",
+		"Back to your terminal",
 		"<code>gack login</code>",
 		"state did not match",
 	} {

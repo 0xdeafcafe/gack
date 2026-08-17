@@ -101,9 +101,9 @@ func (o OAuth) Login(ctx context.Context) (Credential, error) {
 		writer.Header().Set("Content-Type", "text/html; charset=utf-8")
 		if result.err != nil {
 			writer.WriteHeader(http.StatusBadRequest)
-			fmt.Fprint(writer, callbackPage("Couldn’t sign in", result.err.Error(), false))
+			fmt.Fprint(writer, callbackPage("That didn’t quite work", result.err.Error(), false))
 		} else {
-			fmt.Fprint(writer, callbackPage("Authorization received", "Slack handed the session back safely. Gack will continue in your terminal.", true))
+			fmt.Fprint(writer, callbackPage("You’re all set", "Slack and Gack are connected. Your workspace is waiting in the terminal.", true))
 		}
 		select {
 		case callback <- result:
@@ -318,20 +318,22 @@ func OpenBrowser(target string) error {
 
 func callbackPage(title, message string, success bool) string {
 	className := "is-error"
-	status := "ACTION REQUIRED"
-	statusLabel := "Status: action required"
+	status := "LET’S TRY AGAIN"
+	statusLabel := "Status: sign-in needs attention"
 	role := "alert"
 	glyph := "!"
-	nextTitle := "Return to your terminal and try again"
-	nextDetail := "Run <code>gack login</code> when you’re ready."
+	kicker := "Almost there"
+	nextTitle := "Back to your terminal"
+	nextDetail := "Run <code>gack login</code> and we’ll have another go."
 	if success {
 		className = "is-success"
-		status = "COMPLETE"
-		statusLabel = "Status: complete"
+		status = "CONNECTED"
+		statusLabel = "Status: connected"
 		role = "status"
 		glyph = "✓"
-		nextTitle = "Return to your terminal"
-		nextDetail = "Gack is finishing sign-in there."
+		kicker = "Nice, that worked"
+		nextTitle = "Head back to your terminal"
+		nextDetail = "Gack is finishing the last little bit for you."
 	}
 
 	return `<!doctype html>
@@ -339,57 +341,73 @@ func callbackPage(title, message string, success bool) string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="dark">
-<meta name="theme-color" content="#100e15">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#f4ede4">
 <title>` + html.EscapeString(title) + ` · gack</title>
 <style>
-:root{color-scheme:dark;--canvas:#100e15;--line:#4f4658;--muted:#aaa1b0;--text:#fbf7fc;--accent:#d49af2;--accent-soft:#2a1f31;--glow:rgba(185,105,224,.16)}
+:root{color-scheme:light;--cream:#f4ede4;--paper:#fffaf5;--ink:#1d1c1d;--muted:#625c62;--aubergine:#4a154b;--green:#2eb67d;--green-soft:#dff5e9;--blue:#36c5f0;--yellow:#ecb22e;--coral:#e01e5a;--shadow:rgba(74,21,75,.14)}
 *{box-sizing:border-box}
 html,body{min-height:100%}
-body{margin:0;background:var(--canvas);color:var(--text);font:500 16px/1.6 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace}
-body.is-error{--accent:#ff8b82;--accent-soft:#321f25;--glow:rgba(255,91,82,.13)}
-body::before{content:"";position:fixed;inset:0;pointer-events:none;background:radial-gradient(circle at 50% 38%,var(--glow),transparent 42%),linear-gradient(rgba(255,255,255,.018) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.014) 1px,transparent 1px);background-size:auto,32px 32px,32px 32px;mask-image:linear-gradient(to bottom,black,transparent 92%)}
-.page{position:relative;width:min(780px,100%);min-height:100vh;margin:auto;padding:clamp(24px,5vw,56px);display:grid;grid-template-rows:auto 1fr auto}
-.masthead{padding-bottom:18px;border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;gap:24px}
-.brand{font-size:14px;font-weight:900;letter-spacing:.09em}
-.status-badge{display:inline-flex;align-items:center;gap:8px;padding:5px 9px;border:1px solid var(--accent);background:var(--accent-soft);color:var(--accent);font-size:11px;font-weight:900;line-height:1;letter-spacing:.08em;white-space:nowrap}
-.status-badge::before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 12px currentColor}
-.result{align-self:center;padding:clamp(64px,12vh,120px) 0 clamp(52px,10vh,96px);animation:arrive .35s ease-out both}
-.glyph{margin:0 0 24px;color:var(--accent);font-size:clamp(46px,10vw,72px);font-weight:900;line-height:1}
-.eyebrow{margin:0 0 12px;color:var(--accent);font-size:12px;font-weight:900;letter-spacing:.16em}
-h1{max-width:680px;margin:0;color:var(--text);font-size:clamp(34px,7vw,64px);line-height:1.03;letter-spacing:-.055em;overflow-wrap:anywhere}
-.message{max-width:650px;margin:24px 0 0;color:#d7cfdc;font-size:clamp(16px,2.5vw,19px);overflow-wrap:anywhere}
-.next{margin-top:clamp(48px,9vh,80px);padding:20px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line);display:grid;grid-template-columns:88px 1fr;gap:18px}
-.next-label{margin:2px 0 0;color:var(--accent);font-size:11px;font-weight:900;letter-spacing:.14em}
-.next-title{margin:0;color:var(--text);font-size:clamp(17px,3vw,22px);font-weight:800;line-height:1.3}.next-detail{margin:5px 0 0;color:var(--muted);font-size:14px}
-code{padding:.08em .35em;border:1px solid var(--line);background:var(--accent-soft);color:var(--text);font:inherit}
-.foot{padding-top:18px;color:var(--muted);font-size:11px;letter-spacing:.03em}.foot strong{color:var(--accent)}
-@keyframes arrive{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
-@media(max-width:560px){.page{padding:22px}.masthead{align-items:flex-start;flex-direction:column;gap:12px}.result{padding:56px 0 44px}.next{grid-template-columns:1fr;gap:8px}.next-label{margin:0}}
-@media(prefers-reduced-motion:reduce){.result{animation:none}}
-@media(forced-colors:active){.status-badge{forced-color-adjust:none;background:Canvas;color:CanvasText}.status-badge::before{box-shadow:none}}
+body{margin:0;overflow-x:hidden;background:var(--cream);color:var(--ink);font:500 17px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
+body.is-error{--green:#e01e5a;--green-soft:#fde4ec}
+.confetti{position:fixed;inset:0;overflow:hidden;pointer-events:none}
+.shape{position:absolute;display:block;opacity:.92;filter:saturate(.9)}
+.shape.one{width:170px;height:170px;left:-58px;top:-54px;border-radius:42% 58% 65% 35%;background:var(--yellow);transform:rotate(18deg)}
+.shape.two{width:118px;height:38px;right:7%;top:10%;border-radius:999px;background:var(--blue);transform:rotate(-16deg)}
+.shape.three{width:94px;height:94px;right:-24px;bottom:12%;border-radius:50%;background:var(--coral)}
+.shape.four{width:26px;height:92px;left:9%;bottom:8%;border-radius:999px;background:var(--green);transform:rotate(34deg)}
+.shape.five{width:22px;height:22px;right:18%;bottom:7%;border-radius:7px;background:var(--aubergine);transform:rotate(20deg)}
+.page{position:relative;z-index:1;width:min(860px,100%);min-height:100vh;margin:auto;padding:clamp(28px,5vw,64px) 24px;display:grid;place-items:center}
+.card{position:relative;width:100%;overflow:hidden;border:1px solid rgba(74,21,75,.08);border-radius:28px;background:var(--paper);box-shadow:0 26px 70px var(--shadow);animation:arrive .45s cubic-bezier(.2,.8,.2,1) both}
+.colour-bar{height:10px;display:grid;grid-template-columns:1.05fr .9fr 1.1fr .95fr}.colour-bar i:nth-child(1){background:var(--coral)}.colour-bar i:nth-child(2){background:var(--yellow)}.colour-bar i:nth-child(3){background:var(--green)}.colour-bar i:nth-child(4){background:var(--blue)}
+.masthead{padding:26px clamp(26px,5vw,48px) 0;display:flex;align-items:center;justify-content:space-between;gap:20px}
+.brand{display:flex;align-items:center;gap:12px;color:var(--aubergine);font-size:16px;font-weight:850;letter-spacing:-.01em}
+.brand-mark{display:grid;grid-template-columns:repeat(2,9px);gap:4px;transform:rotate(-8deg)}.brand-mark i{width:9px;height:9px;border-radius:3px}.brand-mark i:nth-child(1){background:var(--coral)}.brand-mark i:nth-child(2){background:var(--yellow)}.brand-mark i:nth-child(3){background:var(--green)}.brand-mark i:nth-child(4){background:var(--blue)}
+.brand small{color:#8b6f89;font:700 12px/1 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.04em}
+.status-badge{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:999px;background:var(--green-soft);color:#176b4a;font:800 11px/1 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.07em;white-space:nowrap}.is-error .status-badge{color:#a51646}
+.status-badge::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--green)}
+.result{padding:clamp(46px,8vw,76px) clamp(28px,8vw,76px) clamp(38px,6vw,58px);display:grid;grid-template-columns:112px 1fr;gap:clamp(24px,5vw,48px);align-items:start}
+.celebration{position:relative;width:96px;height:96px;display:grid;place-items:center;border-radius:30px 30px 30px 10px;background:var(--aubergine);box-shadow:10px 10px 0 rgba(236,178,46,.32);transform:rotate(-3deg)}
+.glyph{color:#fff;font-size:48px;font-weight:900;line-height:1;transform:rotate(3deg)}
+.celebration::before,.celebration::after{content:"";position:absolute;border-radius:999px}.celebration::before{width:18px;height:18px;right:-24px;top:-16px;background:var(--blue)}.celebration::after{width:12px;height:34px;left:-20px;bottom:-14px;background:var(--coral);transform:rotate(38deg)}
+.kicker{margin:2px 0 8px;color:var(--aubergine);font:800 13px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.08em;text-transform:uppercase}
+h1{max-width:580px;margin:0;color:var(--aubergine);font-size:clamp(36px,6vw,52px);line-height:1.02;letter-spacing:-.045em;overflow-wrap:anywhere}
+.message{max-width:570px;margin:20px 0 0;color:var(--muted);font-size:clamp(17px,2.3vw,20px);overflow-wrap:anywhere}
+.next{margin-top:32px;padding:20px 22px;border-radius:16px;background:#f0e7ef;display:flex;gap:16px;align-items:center}.next-arrow{flex:0 0 auto;color:var(--aubergine);font-size:30px;font-weight:900;line-height:1}.next-title{margin:0;color:var(--aubergine);font-size:18px;font-weight:800;line-height:1.25}.next-detail{margin:3px 0 0;color:var(--muted);font-size:14px}
+code{padding:.08em .38em;border-radius:5px;background:#e4d6e4;color:var(--aubergine);font:700 .94em/1.2 ui-monospace,SFMono-Regular,Menlo,monospace}
+.foot{padding:18px clamp(26px,5vw,48px) 22px;border-top:1px solid #eadfea;color:#7b6e79;font-size:13px}.foot strong{color:var(--green)}
+@keyframes arrive{from{opacity:0;transform:translateY(12px) rotate(-.3deg)}to{opacity:1;transform:none}}
+@media(max-width:640px){.page{padding:18px}.card{border-radius:22px}.masthead{padding:22px 22px 0;align-items:flex-start}.brand small{display:none}.result{padding:42px 24px 36px;grid-template-columns:1fr;gap:32px}.celebration{width:80px;height:80px;border-radius:25px 25px 25px 9px}.glyph{font-size:40px}.next{align-items:flex-start}.shape.two,.shape.five{display:none}.foot{padding:16px 22px 20px}}
+@media(prefers-reduced-motion:reduce){.card{animation:none}}
+@media(forced-colors:active){.card,.status-badge,.next,.celebration{border:1px solid CanvasText;box-shadow:none}.colour-bar,.confetti{display:none}.glyph,.status-badge,h1,.kicker,.next-title{color:CanvasText}}
 </style>
 </head>
 <body class="` + className + `">
-<main class="page" aria-labelledby="result-title">
-  <header class="masthead">
-    <div class="brand">GACK / SLACK AUTH</div>
-    <div class="status-badge" aria-label="` + statusLabel + `">` + status + `</div>
-  </header>
-  <section class="result" role="` + role + `" aria-live="polite" aria-atomic="true">
-    <div class="glyph" aria-hidden="true">` + glyph + `</div>
-    <p class="eyebrow">SLACK HANDOFF</p>
-    <h1 id="result-title">` + html.EscapeString(title) + `</h1>
-    <p class="message">` + html.EscapeString(message) + `</p>
-    <div class="next">
-      <p class="next-label">NEXT</p>
+<div class="confetti" aria-hidden="true"><i class="shape one"></i><i class="shape two"></i><i class="shape three"></i><i class="shape four"></i><i class="shape five"></i></div>
+<main class="page">
+  <article class="card" aria-labelledby="result-title">
+    <div class="colour-bar" aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+    <header class="masthead">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span><span>gack <small>/ SLACK AUTH</small></span></div>
+      <div class="status-badge" aria-label="` + statusLabel + `">` + status + `</div>
+    </header>
+    <section class="result" role="` + role + `" aria-live="polite" aria-atomic="true">
+      <div class="celebration" aria-hidden="true"><span class="glyph">` + glyph + `</span></div>
       <div>
-        <p class="next-title">` + nextTitle + `</p>
-        <p class="next-detail">` + nextDetail + `</p>
+        <p class="kicker">` + kicker + `</p>
+        <h1 id="result-title">` + html.EscapeString(title) + `</h1>
+        <p class="message">` + html.EscapeString(message) + `</p>
+        <div class="next">
+          <span class="next-arrow" aria-hidden="true">→</span>
+          <div>
+            <p class="next-title">` + nextTitle + `</p>
+            <p class="next-detail">` + nextDetail + `</p>
+          </div>
+        </div>
       </div>
-    </div>
-  </section>
-  <footer class="foot"><strong>●</strong> Safe to close this tab · No credentials are displayed</footer>
+    </section>
+    <footer class="foot"><strong>●</strong> You can close this tab — no credentials are shown here.</footer>
+  </article>
 </main>
 </body>
 </html>`
