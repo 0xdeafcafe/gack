@@ -1,0 +1,761 @@
+package ui
+
+import (
+	"fmt"
+	"html"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+
+	"github.com/0xdeafcafe/gack/internal/gack"
+)
+
+var (
+	purple     = lipgloss.AdaptiveColor{Light: "#5B2C6F", Dark: "#C792EA"}
+	deepPurple = lipgloss.AdaptiveColor{Light: "#3F1D4D", Dark: "#6E3A78"}
+	muted      = lipgloss.AdaptiveColor{Light: "#666666", Dark: "#8B8B8B"}
+	soft       = lipgloss.AdaptiveColor{Light: "#EEEEEE", Dark: "#26232B"}
+	warning    = lipgloss.AdaptiveColor{Light: "#9A3412", Dark: "#FFB86C"}
+	danger     = lipgloss.AdaptiveColor{Light: "#B91C1C", Dark: "#FF6B6B"}
+	green      = lipgloss.AdaptiveColor{Light: "#166534", Dark: "#50FA7B"}
+
+	headerStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FFFFFF")).Background(deepPurple)
+	footerStyle    = lipgloss.NewStyle().Foreground(muted)
+	activeBorder   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(purple)
+	inactiveBorder = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(muted)
+	selectedStyle  = lipgloss.NewStyle().Foreground(purple).Bold(true)
+	dimStyle       = lipgloss.NewStyle().Foreground(muted)
+	errorStyle     = lipgloss.NewStyle().Foreground(danger).Bold(true)
+	successStyle   = lipgloss.NewStyle().Foreground(green)
+
+	mentionPattern = regexp.MustCompile(`<@([A-Z0-9_]+)>`)
+	channelPattern = regexp.MustCompile(`<#([A-Z0-9_]+)(\|([^>]+))?>`)
+	linkPattern    = regexp.MustCompile(`<((https?://|mailto:)[^>|]+)(\|([^>]+))?>`)
+	emojiPattern   = regexp.MustCompile(`:([a-zA-Z0-9_+\-]+):`)
+)
+
+func (m *Model) View() string {
+	if m.width <= 0 || m.height <= 0 {
+		return "Starting gack…"
+	}
+	header := m.renderHeader()
+	bodyHeight := max(3, m.height-2)
+	var body string
+	switch {
+	case m.dialog != nil:
+		body = m.renderDialog(bodyHeight)
+	case m.overlay == overlayGlobalSearch:
+		body = m.renderSearch(bodyHeight)
+	case m.overlay == overlayAction || m.overlay == overlayReaction:
+		body = m.renderPicker(bodyHeight)
+	case m.overlay == overlayHelp:
+		body = m.renderHelp(bodyHeight)
+	default:
+		body = m.renderBody(bodyHeight)
+	}
+	footer := m.renderFooter()
+	return header + "\n" + body + "\n" + footer
+}
+
+func (m *Model) renderHeader() string {
+	location := "Starting"
+	if m.ready {
+		switch m.mode {
+		case viewActivity:
+			location = "Activity"
+		case viewNotifications:
+			location = "Notifications"
+		default:
+			if m.channel >= 0 && m.channel < len(m.channels) {
+				location = m.channels[m.channel].Label()
+			}
+		}
+	}
+	left := "GACK  " + m.snapshot.Team
+	if m.snapshot.Team == "" {
+		left = "GACK"
+	}
+	right := location + "    Ctrl+K Search"
+	gap := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right)-2)
+	line := left + strings.Repeat(" ", gap) + right
+	return headerStyle.Width(max(0, m.width)).Render(truncate(line, max(1, m.width)))
+}
+
+func (m *Model) renderFooter() string {
+	var value string
+	style := footerStyle
+	switch {
+	case m.overlay == overlayFind:
+		value = m.findInput.View() + "  Enter next · Ctrl+P previous · Esc close"
+	case m.focus == focusComposer:
+		value = m.composeInput.View() + "  Enter send · Esc cancel"
+	case m.err != "":
+		value = "Error: " + m.err
+		style = errorStyle
+	case m.busy != "":
+		value = "◌ " + m.busy
+	case m.status != "":
+		value = m.status
+		style = successStyle
+	default:
+		value = "j/k move · Enter thread · c compose · r react · i interact · R refresh · ? help · q quit"
+	}
+	return style.Width(max(0, m.width)).Render(truncate(value, max(1, m.width)))
+}
+
+func (m *Model) renderBody(height int) string {
+	if !m.ready {
+		message := m.busy
+		if m.err != "" {
+			message = errorStyle.Render(m.err)
+		}
+		return lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, message)
+	}
+	sidebarWidth := m.sidebarWidth()
+	if sidebarWidth >= m.width {
+		return m.renderSidebar(m.width, height)
+	}
+	sidebar := ""
+	if sidebarWidth > 0 {
+		sidebar = m.renderSidebar(sidebarWidth, height)
+	}
+	available := m.width - sidebarWidth
+	var content string
+	if m.mode == viewActivity || m.mode == viewNotifications {
+		content = m.renderActivity(available, height)
+	} else if m.threadTS != "" && available >= 72 {
+		threadWidth := max(30, available*2/5)
+		conversationWidth := available - threadWidth
+		content = lipgloss.JoinHorizontal(lipgloss.Top,
+			m.renderConversation(conversationWidth, height),
+			m.renderThread(threadWidth, height),
+		)
+	} else if m.threadTS != "" && m.focus == focusThread {
+		content = m.renderThread(available, height)
+	} else {
+		content = m.renderConversation(available, height)
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, sidebar, content)
+}
+
+func (m *Model) sidebarWidth() int {
+	if m.width < 44 {
+		if m.focus == focusSidebar {
+			return m.width
+		}
+		return 0
+	}
+	return min(30, max(22, m.width/4))
+}
+
+func (m *Model) renderSidebar(width, height int) string {
+	innerHeight := max(1, height-2)
+	innerWidth := max(1, width-2)
+	lines := make([]string, 0, innerHeight)
+	unreadActivity := 0
+	for _, item := range m.activity {
+		if item.Unread {
+			unreadActivity++
+		}
+	}
+	lines = append(lines,
+		m.sidebarLine("● Notifications", unreadActivity, m.sidebarAt == 0 && m.focus == focusSidebar, innerWidth),
+		m.sidebarLine("◷ Activity", len(m.activity), m.sidebarAt == 1 && m.focus == focusSidebar, innerWidth),
+		"",
+		dimStyle.Render("CHANNELS")+dimStyle.Render("  drag · ⇧J/K"),
+	)
+	available := max(0, innerHeight-len(lines))
+	cursor := m.channel
+	if m.sidebarAt >= 2 {
+		cursor = m.sidebarAt - 2
+	}
+	start := max(0, cursor-available/2)
+	if start+available > len(m.channels) {
+		start = max(0, len(m.channels)-available)
+	}
+	m.visibleChannelStart = start
+	// Global terminal row: one header row, one pane border row, four sidebar
+	// rows above the first channel.
+	m.channelRowStart = 1 + 1 + 4
+	for index := start; index < len(m.channels) && len(lines) < innerHeight; index++ {
+		channel := m.channels[index]
+		label := channel.Label()
+		if index == m.dragAt {
+			label = "↕ " + label
+		}
+		lines = append(lines, m.sidebarLine(label, channel.Unread, m.sidebarAt == index+2 && m.focus == focusSidebar, innerWidth))
+	}
+	for len(lines) < innerHeight {
+		lines = append(lines, "")
+	}
+	style := inactiveBorder
+	if m.focus == focusSidebar {
+		style = activeBorder
+	}
+	return style.Width(innerWidth).Height(innerHeight).Render(cropLines(strings.Join(lines, "\n"), innerHeight, innerWidth))
+}
+
+func (m *Model) sidebarLine(label string, count int, selected bool, width int) string {
+	badge := ""
+	if count > 0 {
+		badge = fmt.Sprintf(" %d", count)
+	}
+	space := max(1, width-lipgloss.Width(label)-lipgloss.Width(badge)-1)
+	line := " " + truncate(label, max(1, width-lipgloss.Width(badge)-2)) + strings.Repeat(" ", space) + badge
+	line = truncate(line, width)
+	if selected {
+		return selectedStyle.Background(soft).Width(width).Render(line)
+	}
+	if count > 0 {
+		return lipgloss.NewStyle().Bold(true).Width(width).Render(line)
+	}
+	return line
+}
+
+func (m *Model) renderConversation(width, height int) string {
+	title := "Conversation"
+	if m.channel >= 0 && m.channel < len(m.channels) {
+		channel := m.channels[m.channel]
+		title = channel.Label()
+		if channel.Topic != "" && width > 48 {
+			title += dimStyle.Render("  " + truncate(channel.Topic, width-lipgloss.Width(channel.Label())-8))
+		}
+	}
+	contentHeight := max(1, height-3)
+	content := m.virtualMessages(m.messages, m.message, contentHeight, max(12, width-4), m.focus == focusMessages)
+	if len(m.messages) == 0 && m.busy == "" {
+		content = dimStyle.Render("No messages in this conversation.")
+	}
+	return m.renderPane(title, content, width, height, m.focus == focusMessages || (m.focus == focusComposer && m.composeThread == ""))
+}
+
+func (m *Model) renderThread(width, height int) string {
+	title := "Thread"
+	if len(m.thread) > 0 {
+		title += dimStyle.Render(fmt.Sprintf("  %d replies", max(0, len(m.thread)-1)))
+	}
+	content := m.virtualMessages(m.thread, m.threadAt, max(1, height-3), max(12, width-4), m.focus == focusThread)
+	if len(m.thread) == 0 {
+		content = dimStyle.Render("Loading thread…")
+	}
+	return m.renderPane(title, content, width, height, m.focus == focusThread || (m.focus == focusComposer && m.composeThread != ""))
+}
+
+func (m *Model) renderActivity(width, height int) string {
+	title := "Activity"
+	if m.mode == viewNotifications {
+		title = "Notifications"
+	}
+	items := m.filteredActivity()
+	contentHeight := max(1, height-3)
+	if len(items) == 0 {
+		return m.renderPane(title, dimStyle.Render("You’re all caught up."), width, height, m.focus != focusSidebar)
+	}
+	itemHeight := 4
+	visible := max(1, contentHeight/itemHeight)
+	start := max(0, m.activityAt-visible/2)
+	if start+visible > len(items) {
+		start = max(0, len(items)-visible)
+	}
+	var rendered []string
+	for index := start; index < len(items) && index < start+visible; index++ {
+		item := items[index]
+		marker := "  "
+		if index == m.activityAt && m.focus != focusSidebar {
+			marker = selectedStyle.Render("▌ ")
+		}
+		unread := ""
+		if item.Unread {
+			unread = " ●"
+		}
+		heading := fmt.Sprintf("%s%s in #%s%s", marker, activityIcon(item.Kind), item.ChannelName, unread)
+		bodyWidth := max(8, width-8)
+		body := wrapText(formatSlackText(item.Text, m.snapshot.Users, m.channels), bodyWidth)
+		rendered = append(rendered, heading+"\n  "+item.Actor+dimStyle.Render(" · "+relativeTime(item.Time))+"\n  "+strings.Join(body, "\n  "))
+	}
+	return m.renderPane(title, strings.Join(rendered, "\n\n"), width, height, m.focus != focusSidebar)
+}
+
+func (m *Model) renderPane(title, content string, width, height int, active bool) string {
+	if width <= 2 || height <= 2 {
+		return ""
+	}
+	innerWidth, innerHeight := width-2, height-2
+	titleLine := lipgloss.NewStyle().Bold(true).Render(truncate(title, innerWidth))
+	contentHeight := max(0, innerHeight-1)
+	content = cropLines(content, contentHeight, innerWidth)
+	if contentHeight > 0 {
+		content = titleLine + "\n" + content
+	} else {
+		content = titleLine
+	}
+	style := inactiveBorder
+	if active {
+		style = activeBorder
+	}
+	return style.Width(innerWidth).Height(innerHeight).Render(content)
+}
+
+func (m *Model) virtualMessages(messages []gack.Message, selected, height, width int, active bool) string {
+	if len(messages) == 0 || height <= 0 {
+		return ""
+	}
+	selected = max(0, min(len(messages)-1, selected))
+	type renderedMessage struct {
+		index  int
+		value  string
+		height int
+	}
+	current := m.renderMessage(messages[selected], width, active, selected)
+	rows := []renderedMessage{{selected, current, max(1, lipgloss.Height(current))}}
+	used := rows[0].height
+	// Fill beneath the cursor first, then use all remaining rows above it. Only
+	// visible messages are formatted, so a very large backing history has flat
+	// rendering cost.
+	for index := selected + 1; index < len(messages) && used < height/2; index++ {
+		value := m.renderMessage(messages[index], width, false, index)
+		h := max(1, lipgloss.Height(value)) + 1
+		if used+h > height {
+			break
+		}
+		rows = append(rows, renderedMessage{index, value, h})
+		used += h
+	}
+	for index := selected - 1; index >= 0 && used < height; index-- {
+		value := m.renderMessage(messages[index], width, false, index)
+		h := max(1, lipgloss.Height(value)) + 1
+		if used+h > height {
+			break
+		}
+		rows = append([]renderedMessage{{index, value, h}}, rows...)
+		used += h
+	}
+	for index := rows[len(rows)-1].index + 1; index < len(messages) && used < height; index++ {
+		value := m.renderMessage(messages[index], width, false, index)
+		h := max(1, lipgloss.Height(value)) + 1
+		if used+h > height {
+			break
+		}
+		rows = append(rows, renderedMessage{index, value, h})
+		used += h
+	}
+	parts := make([]string, len(rows))
+	for i, row := range rows {
+		parts[i] = row.value
+	}
+	return strings.Join(parts, "\n")
+}
+
+func (m *Model) renderMessage(message gack.Message, width int, selected bool, index int) string {
+	marker := "  "
+	if selected {
+		marker = selectedStyle.Render("▌ ")
+	}
+	username := message.Username
+	if user, ok := m.snapshot.Users[message.UserID]; ok && username == "" {
+		username = user.DisplayName()
+	}
+	if username == "" {
+		username = "unknown"
+	}
+	heading := marker + lipgloss.NewStyle().Bold(true).Render(username) + dimStyle.Render("  "+message.Time.Format("15:04"))
+	if message.Edited {
+		heading += dimStyle.Render("  edited")
+	}
+	bodyWidth := max(8, width-2)
+	lines := []string{heading}
+	text := strings.TrimSpace(formatSlackText(message.Text, m.snapshot.Users, m.channels))
+	if text != "" {
+		for _, line := range wrapText(text, bodyWidth) {
+			lines = append(lines, "  "+line)
+		}
+	}
+	actionNumber := 0
+	for _, block := range message.Blocks {
+		switch block.Type {
+		case "divider":
+			lines = append(lines, dimStyle.Render("  "+strings.Repeat("─", max(3, min(bodyWidth, 40)))))
+		default:
+			blockText := strings.TrimSpace(formatSlackText(block.Text, m.snapshot.Users, m.channels))
+			if blockText != "" && blockText != text {
+				for _, line := range wrapText(blockText, bodyWidth) {
+					lines = append(lines, "  "+line)
+				}
+			}
+		}
+		var controls []string
+		for _, element := range block.Elements {
+			if element.Type == "field" {
+				for _, line := range wrapText(formatSlackText(element.Text, m.snapshot.Users, m.channels), bodyWidth) {
+					lines = append(lines, "  "+line)
+				}
+				continue
+			}
+			if element.ActionID == "" {
+				continue
+			}
+			actionNumber++
+			label := firstNonEmpty(element.Text, element.Placeholder, element.ActionID)
+			if element.Type != "button" {
+				label += " ▾"
+			}
+			if selected {
+				controls = append(controls, selectedStyle.Render(fmt.Sprintf("[%d %s]", actionNumber, label)))
+			} else {
+				controls = append(controls, "["+label+"]")
+			}
+		}
+		if len(controls) > 0 {
+			lines = append(lines, "  "+strings.Join(controls, "  "))
+		}
+	}
+	if len(message.Reactions) > 0 {
+		var reactions []string
+		for _, reaction := range message.Reactions {
+			if reaction.Count <= 0 {
+				continue
+			}
+			label := fmt.Sprintf("%s %d", renderEmoji(reaction.Name), reaction.Count)
+			if reaction.Mine {
+				label = selectedStyle.Render("[" + label + "]")
+			} else {
+				label = "[" + label + "]"
+			}
+			reactions = append(reactions, label)
+		}
+		if len(reactions) > 0 {
+			lines = append(lines, "  "+strings.Join(reactions, " "))
+		}
+	}
+	if message.ReplyCount > 0 {
+		lines = append(lines, selectedStyle.Render(fmt.Sprintf("  ↳ %d replies  Enter to open", message.ReplyCount)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *Model) renderSearch(height int) string {
+	width := min(max(34, m.width-8), 82)
+	inner := max(1, width-4)
+	lines := []string{lipgloss.NewStyle().Bold(true).Render("Jump to…"), "", m.searchInput.View(), ""}
+	if m.busy == "Searching…" {
+		lines = append(lines, dimStyle.Render("Searching messages…"))
+	} else if m.searchRan {
+		if len(m.searchResults) == 0 {
+			lines = append(lines, dimStyle.Render("No messages found"))
+		}
+		for index, result := range m.searchResults {
+			label := fmt.Sprintf("#%-16s %s", result.ChannelName, oneLine(formatSlackText(result.Message.Text, m.snapshot.Users, m.channels)))
+			lines = append(lines, chooserLine(label, index == m.searchAt, inner))
+		}
+	} else {
+		channels := m.filteredChannels(m.searchInput.Value())
+		for index, channel := range channels {
+			label := channel.Label()
+			if channel.Topic != "" {
+				label += dimStyle.Render("  " + oneLine(channel.Topic))
+			}
+			lines = append(lines, chooserLine(label, index == m.searchAt, inner))
+		}
+		if strings.TrimSpace(m.searchInput.Value()) != "" {
+			label := "⌕  Search messages for “" + m.searchInput.Value() + "”"
+			lines = append(lines, chooserLine(label, m.searchAt == len(channels), inner))
+		}
+	}
+	lines = append(lines, "", dimStyle.Render("↑/↓ choose · Enter open/search · Esc close"))
+	boxHeight := min(height-2, max(10, len(lines)+2))
+	box := activeBorder.Width(width - 2).Height(boxHeight - 2).Render(cropLines(strings.Join(lines, "\n"), boxHeight-2, width-4))
+	return lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, box)
+}
+
+func (m *Model) renderPicker(height int) string {
+	title := "Choose an action"
+	if m.overlay == overlayReaction {
+		title = "Add or remove a reaction"
+	}
+	width := min(54, max(30, m.width-8))
+	inner := width - 4
+	lines := []string{lipgloss.NewStyle().Bold(true).Render(title), ""}
+	for index, option := range m.pickerOptions {
+		lines = append(lines, chooserLine(option.label, index == m.pickerAt, inner))
+	}
+	lines = append(lines, "", dimStyle.Render("↑/↓ choose · Enter apply · Esc close"))
+	boxHeight := min(height-2, len(lines)+2)
+	box := activeBorder.Width(width - 2).Height(boxHeight - 2).Render(cropLines(strings.Join(lines, "\n"), boxHeight-2, inner))
+	return lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, box)
+}
+
+func (m *Model) renderDialog(height int) string {
+	dialog := m.dialog
+	width := min(76, max(36, m.width-6))
+	inner := width - 4
+	lines := []string{lipgloss.NewStyle().Bold(true).Foreground(purple).Render(dialog.view.Title), ""}
+	for _, block := range dialog.view.Blocks {
+		if block.Type == "section" && block.Text != "" {
+			lines = append(lines, wrapText(formatSlackText(block.Text, m.snapshot.Users, m.channels), inner)...)
+			lines = append(lines, "")
+		}
+	}
+	for index := range dialog.fields {
+		field := &dialog.fields[index]
+		if !field.visible {
+			continue
+		}
+		marker := "  "
+		if index == dialog.at {
+			marker = selectedStyle.Render("▌ ")
+		}
+		label := field.block.Label
+		if label == "" {
+			label = firstNonEmpty(field.element.Text, field.element.Placeholder, field.element.ActionID)
+		}
+		if field.block.Optional {
+			label += dimStyle.Render(" (optional)")
+		}
+		lines = append(lines, marker+label)
+		switch {
+		case isTextField(field.element.Type):
+			lines = append(lines, "  "+field.input.View())
+		case field.element.Type == "checkboxes" || strings.Contains(field.element.Type, "multi_"):
+			for optionIndex, option := range field.element.Options {
+				check := "[ ]"
+				if field.checked[option.Value] {
+					check = "[x]"
+				}
+				cursor := "  "
+				if index == dialog.at && optionIndex == field.selected {
+					cursor = "› "
+				}
+				lines = append(lines, "  "+cursor+check+" "+option.Text)
+			}
+		case len(field.element.Options) > 0:
+			value := dimStyle.Render("Choose with ←/→")
+			if field.selected >= 0 && field.selected < len(field.element.Options) {
+				value = selectedStyle.Render("‹ " + field.element.Options[field.selected].Text + " ›")
+			}
+			lines = append(lines, "    "+value)
+		case field.element.Type == "button":
+			lines = append(lines, "    "+selectedStyle.Render("[Enter  "+field.element.Text+"]"))
+		}
+		if field.error != "" {
+			lines = append(lines, "  "+errorStyle.Render(field.error))
+		}
+		lines = append(lines, "")
+	}
+	submit := dialog.view.Submit
+	if submit == "" {
+		submit = "Submit"
+	}
+	closeLabel := dialog.view.Close
+	if closeLabel == "" {
+		closeLabel = "Cancel"
+	}
+	lines = append(lines,
+		selectedStyle.Render("[Ctrl+S  "+submit+"]")+"  "+dimStyle.Render("[Esc  "+closeLabel+"]"),
+		dimStyle.Render("Tab moves fields · arrows choose · Space toggles"),
+	)
+	boxHeight := min(height-2, max(12, len(lines)+2))
+	content := cropLines(strings.Join(lines, "\n"), boxHeight-2, inner)
+	box := activeBorder.Width(width - 2).Height(boxHeight - 2).Render(content)
+	return lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, box)
+}
+
+func (m *Model) renderHelp(height int) string {
+	width := min(74, max(36, m.width-6))
+	lines := []string{
+		lipgloss.NewStyle().Bold(true).Foreground(purple).Render("Keyboard & mouse"), "",
+		"Ctrl+K       Jump to a channel or search all messages",
+		"Ctrl+F       Find text in the current conversation/thread",
+		"j / k        Move down / up", "g / G        First / last message",
+		"Enter / t    Open a thread", "c            Compose or reply",
+		"r            Add/remove emoji reaction", "i or 1–9     Use Block Kit actions",
+		"a / n        Activity / unread notifications", "Tab          Move between panes",
+		"R            Refresh the current view",
+		"Shift+J/K    Reorder the selected channel", "Mouse drag   Reorder channels; wheel scrolls messages",
+		"Esc          Go back", "q            Quit", "",
+		dimStyle.Render("Terminal protocols generally do not transmit the macOS Command key."),
+		dimStyle.Render("Map Cmd+K to Ctrl+K in your terminal if you want the native chord."), "",
+		dimStyle.Render("Press ? or Esc to close"),
+	}
+	boxHeight := min(height-2, len(lines)+2)
+	box := activeBorder.Width(width - 2).Height(boxHeight - 2).Render(cropLines(strings.Join(lines, "\n"), boxHeight-2, width-4))
+	return lipgloss.Place(m.width, height, lipgloss.Center, lipgloss.Center, box)
+}
+
+func chooserLine(label string, selected bool, width int) string {
+	prefix := "  "
+	if selected {
+		prefix = "› "
+	}
+	line := truncate(prefix+label, width)
+	if selected {
+		return selectedStyle.Background(soft).Width(width).Render(line)
+	}
+	return line
+}
+
+func formatSlackText(text string, users map[string]gack.User, channels []gack.Conversation) string {
+	text = html.UnescapeString(text)
+	text = mentionPattern.ReplaceAllStringFunc(text, func(match string) string {
+		parts := mentionPattern.FindStringSubmatch(match)
+		if user, ok := users[parts[1]]; ok {
+			return "@" + user.DisplayName()
+		}
+		return "@" + parts[1]
+	})
+	text = channelPattern.ReplaceAllStringFunc(text, func(match string) string {
+		parts := channelPattern.FindStringSubmatch(match)
+		if len(parts) > 3 && parts[3] != "" {
+			return "#" + parts[3]
+		}
+		for _, channel := range channels {
+			if channel.ID == parts[1] {
+				return channel.Label()
+			}
+		}
+		return "#" + parts[1]
+	})
+	text = linkPattern.ReplaceAllStringFunc(text, func(match string) string {
+		parts := linkPattern.FindStringSubmatch(match)
+		if len(parts) > 4 && parts[4] != "" {
+			return parts[4] + " (" + parts[1] + ")"
+		}
+		return parts[1]
+	})
+	text = emojiPattern.ReplaceAllStringFunc(text, func(match string) string {
+		parts := emojiPattern.FindStringSubmatch(match)
+		if emoji := renderEmoji(parts[1]); emoji != ":"+parts[1]+":" {
+			return emoji
+		}
+		return match
+	})
+	return text
+}
+
+func renderEmoji(name string) string {
+	if emoji, ok := map[string]string{
+		"+1": "👍", "thumbsup": "👍", "heart": "❤️", "tada": "🎉", "eyes": "👀",
+		"white_check_mark": "✅", "rocket": "🚀", "raised_hands": "🙌", "joy": "😂",
+		"warning": "⚠️", "fire": "🔥", "wave": "👋", "thinking_face": "🤔",
+	}[name]; ok {
+		return emoji
+	}
+	return ":" + name + ":"
+}
+
+func wrapText(text string, width int) []string {
+	if width <= 0 {
+		return nil
+	}
+	var result []string
+	for _, paragraph := range strings.Split(text, "\n") {
+		if paragraph == "" {
+			result = append(result, "")
+			continue
+		}
+		words := strings.Fields(paragraph)
+		line := ""
+		for _, word := range words {
+			if utf8.RuneCountInString(word) > width {
+				if line != "" {
+					result = append(result, line)
+					line = ""
+				}
+				runes := []rune(word)
+				for len(runes) > width {
+					result = append(result, string(runes[:width]))
+					runes = runes[width:]
+				}
+				line = string(runes)
+				continue
+			}
+			if line == "" {
+				line = word
+			} else if utf8.RuneCountInString(line)+1+utf8.RuneCountInString(word) <= width {
+				line += " " + word
+			} else {
+				result = append(result, line)
+				line = word
+			}
+		}
+		if line != "" {
+			result = append(result, line)
+		}
+	}
+	return result
+}
+
+func cropLines(value string, height, width int) string {
+	if height <= 0 {
+		return ""
+	}
+	lines := strings.Split(value, "\n")
+	if len(lines) > height {
+		lines = lines[:height]
+	}
+	for i := range lines {
+		lines[i] = truncateANSI(lines[i], width)
+	}
+	for len(lines) < height {
+		lines = append(lines, "")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func truncate(value string, width int) string {
+	if width <= 0 || lipgloss.Width(value) <= width {
+		return value
+	}
+	runes := []rune(value)
+	if width == 1 {
+		return "…"
+	}
+	for len(runes) > 0 && lipgloss.Width(string(runes))+1 > width {
+		runes = runes[:len(runes)-1]
+	}
+	return string(runes) + "…"
+}
+
+func truncateANSI(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	return ansi.Truncate(value, width, "")
+}
+
+func oneLine(value string) string { return strings.Join(strings.Fields(value), " ") }
+
+func relativeTime(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	delta := time.Since(value)
+	if delta < time.Minute {
+		return "now"
+	}
+	if delta < time.Hour {
+		return fmt.Sprintf("%dm", int(delta.Minutes()))
+	}
+	if delta < 24*time.Hour {
+		return fmt.Sprintf("%dh", int(delta.Hours()))
+	}
+	return value.Format("Jan 2")
+}
+
+func activityIcon(kind string) string {
+	icons := map[string]string{"mention": "@", "thread": "↳", "reaction": "☺", "message": "●"}
+	if icon := icons[kind]; icon != "" {
+		return icon
+	}
+	return "•"
+}
+
+// Sorting is kept deterministic for tests and for bridge responses that omit
+// timestamp ordering.
+func sortMessages(messages []gack.Message) {
+	sort.SliceStable(messages, func(i, j int) bool { return messages[i].Time.Before(messages[j].Time) })
+}
