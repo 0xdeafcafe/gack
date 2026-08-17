@@ -6,8 +6,16 @@ import "github.com/0xdeafcafe/gack/internal/gack"
 // They contain data only: no callbacks, channels, or mutable shared state.
 
 type bootstrapResult struct {
-	snapshot gack.Snapshot
-	err      error
+	request     uint64
+	progressive bool
+	snapshot    gack.Snapshot
+	err         error
+}
+
+type usersResult struct {
+	request uint64
+	users   map[string]gack.User
+	err     error
 }
 
 type messagesResult struct {

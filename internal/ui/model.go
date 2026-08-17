@@ -104,15 +104,22 @@ type Model struct {
 	err    string
 	spin   spinner.Model
 
-	connectStarted  time.Time
-	checkUpdate     func(context.Context) (string, error)
-	notify          func(context.Context, string, string) error
-	knownActivity   map[string]struct{}
-	activitySeen    []string
-	activityPrimed  bool
-	activityPolling bool
-	updateAvailable string
-	exitAction      ExitAction
+	connectStarted   time.Time
+	bootstrapRequest uint64
+	bootstrapApplied uint64
+	usersRequest     uint64
+	usersApplied     uint64
+	usersLoading     bool
+	usersReady       bool
+	usersErr         string
+	checkUpdate      func(context.Context) (string, error)
+	notify           func(context.Context, string, string) error
+	knownActivity    map[string]struct{}
+	activitySeen     []string
+	activityPrimed   bool
+	activityPolling  bool
+	updateAvailable  string
+	exitAction       ExitAction
 
 	snapshot            gack.Snapshot
 	channels            []gack.Conversation
@@ -248,7 +255,7 @@ func (m *Model) rememberActivity(item gack.ActivityItem) bool {
 
 func (m *Model) Init() tea.Cmd {
 	m.startConnecting()
-	commands := []tea.Cmd{m.spin.Tick, bootstrapCmd(m.backend), scheduleActivityPoll(15 * time.Second)}
+	commands := []tea.Cmd{m.spin.Tick, m.beginBootstrap(), scheduleActivityPoll(15 * time.Second)}
 	if m.checkUpdate != nil {
 		commands = append(commands, checkUpdateCmd(m.checkUpdate))
 	}
@@ -305,7 +312,7 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			switch key {
 			case "r", "R", "enter":
 				m.startConnecting()
-				return m, tea.Batch(m.spin.Tick, bootstrapCmd(m.backend))
+				return m, tea.Batch(m.spin.Tick, m.beginBootstrap())
 			case "l":
 				m.exitAction = ExitLogin
 				return m, tea.Quit
@@ -315,6 +322,9 @@ func (m *Model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 		return m, nil
+	}
+	if key == "U" && m.usersErr != "" && !m.usersLoading {
+		return m, m.beginUserHydration()
 	}
 	if key == "u" && m.updateAvailable != "" {
 		m.exitAction = ExitUpdate
@@ -407,6 +417,34 @@ func (m *Model) startConnecting() {
 	m.status = ""
 	m.busy = "Connecting…"
 	m.connectStarted = time.Now()
+}
+
+func (m *Model) beginBootstrap() tea.Cmd {
+	m.bootstrapRequest++
+	request := m.bootstrapRequest
+	progressive, ok := m.backend.(gack.ProgressiveBootstrapper)
+	if !ok {
+		return bootstrapRequestCmd(m.backend, request)
+	}
+	commands := []tea.Cmd{bootstrapCoreCmd(progressive, request)}
+	if !m.usersReady && !m.usersLoading {
+		commands = append(commands, m.beginUserHydration())
+	}
+	return tea.Batch(commands...)
+}
+
+func (m *Model) beginUserHydration() tea.Cmd {
+	progressive, ok := m.backend.(gack.ProgressiveBootstrapper)
+	if !ok || m.usersReady || m.usersLoading {
+		return nil
+	}
+	m.usersRequest++
+	m.usersLoading = true
+	m.usersErr = ""
+	if m.ready {
+		m.status = "Refreshing people details…"
+	}
+	return hydrateUsersCmd(progressive, m.usersRequest)
 }
 
 func (m *Model) updateSidebar(key string) tea.Cmd {
@@ -1272,7 +1310,6 @@ func (m *Model) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 		if insideChannelList {
 			m.focus = focusSidebar
-			m.sidebarAt = channelIndex + 2
 			m.dragFrom, m.dragAt, m.dragMoved = channelIndex, channelIndex, false
 			return m, nil
 		}
@@ -1306,6 +1343,10 @@ func (m *Model) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			moved := m.dragMoved
 			at := m.dragAt
 			m.dragFrom, m.dragAt, m.dragMoved = -1, -1, false
+			// Opening a channel can recenter the virtual sidebar. Do not leave a
+			// stale pointer label attached to whatever row moved under the mouse;
+			// the next real motion event will identify the new target.
+			m.clearHover()
 			if moved {
 				return m, m.saveSidebarPreferences("Manual channel order saved")
 			}

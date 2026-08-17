@@ -49,3 +49,17 @@ func TestParseBlocksRejectsMalformedJSON(t *testing.T) {
 		t.Fatal("expected malformed Block Kit error")
 	}
 }
+
+func TestParseBlocksPreservesRichTextLinkDestination(t *testing.T) {
+	raw := json.RawMessage(`[{"type":"rich_text","elements":[{"type":"rich_text_section","elements":[
+  {"type":"text","text":"Read "},
+  {"type":"link","url":"https://example.com/runbook","text":"the runbook"}
+]}]}]`)
+	blocks, err := ParseBlocks(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := blocks[0].Text, "Read <https://example.com/runbook|the runbook>"; got != want {
+		t.Fatalf("rich text = %q, want %q", got, want)
+	}
+}

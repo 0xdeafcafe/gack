@@ -15,6 +15,7 @@ type applicationEvent interface {
 }
 
 func (bootstrapResult) applicationEvent()    {}
+func (usersResult) applicationEvent()        {}
 func (messagesResult) applicationEvent()     {}
 func (threadResult) applicationEvent()       {}
 func (postResult) applicationEvent()         {}

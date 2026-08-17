@@ -37,6 +37,7 @@ type slackElement struct {
 	Text           slackText       `json:"text"`
 	Value          string          `json:"value"`
 	Name           string          `json:"name"`
+	Range          string          `json:"range"`
 	URL            string          `json:"url"`
 	UserID         string          `json:"user_id"`
 	ChannelID      string          `json:"channel_id"`
@@ -170,13 +171,19 @@ func flattenRichText(elements []slackElement) string {
 				if len(item.Elements) > 0 {
 					walk(item.Elements)
 				}
-				if item.Text.Text != "" {
-					builder.WriteString(item.Text.Text)
-				}
 				switch item.Type {
 				case "link":
-					if item.Text.Text == "" {
+					label := item.Text.Text
+					switch {
+					case item.URL == "":
+						builder.WriteString(label)
+					case label == "" || label == item.URL:
 						builder.WriteString(item.URL)
+					default:
+						// Keep Slack's mrkdwn link form until the UI resolves it.
+						// A terminal cannot attach a URL to styled text invisibly,
+						// so this becomes "label (URL)" at render time.
+						builder.WriteString("<" + item.URL + "|" + label + ">")
 					}
 				case "emoji":
 					builder.WriteString(":" + item.Name + ":")
@@ -185,7 +192,13 @@ func flattenRichText(elements []slackElement) string {
 				case "channel":
 					builder.WriteString("<#" + item.ChannelID + ">")
 				case "broadcast":
-					builder.WriteString("@" + item.Name)
+					rangeName := item.Range
+					if rangeName == "" {
+						rangeName = item.Name
+					}
+					builder.WriteString("@" + rangeName)
+				default:
+					builder.WriteString(item.Text.Text)
 				}
 			}
 		}

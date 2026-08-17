@@ -3,12 +3,18 @@ package slack
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/0xdeafcafe/gack/internal/gack"
 )
+
+var _ gack.ProgressiveBootstrapper = (*Client)(nil)
 
 func TestClientBootstrapMessagesSearchAndReaction(t *testing.T) {
 	var mu sync.Mutex
@@ -100,12 +106,294 @@ func TestClientReportsSlackAPIErrors(t *testing.T) {
 	}
 }
 
+func TestBootstrapFetchesIndependentDatasetsConcurrently(t *testing.T) {
+	started := make(chan string, 3)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		method := strings.TrimPrefix(request.URL.Path, "/")
+		started <- method
+		select {
+		case <-release:
+		case <-request.Context().Done():
+			return
+		}
+		switch method {
+		case "auth.test":
+			writeJSON(writer, `{"ok":true,"user_id":"U1","user":"alex","team":"Acme"}`)
+		case "users.list":
+			writeJSON(writer, `{"ok":true,"members":[{"id":"U1","name":"alex","profile":{"display_name":"Alex"}},{"id":"U2","name":"maya","profile":{"real_name":"Maya"}}]}`)
+		case "users.conversations":
+			writeJSON(writer, `{"ok":true,"channels":[{"id":"C1","name":"general"},{"id":"D1","user":"U2","is_im":true}]}`)
+		default:
+			http.Error(writer, `{"ok":false,"error":"unknown_method"}`, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := New(Config{Token: "test", BaseURL: server.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type bootstrapResult struct {
+		snapshot gack.Snapshot
+		err      error
+	}
+	done := make(chan bootstrapResult, 1)
+	go func() {
+		snapshot, err := client.Bootstrap(context.Background())
+		done <- bootstrapResult{snapshot: snapshot, err: err}
+	}()
+
+	methods := make(map[string]bool, 3)
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for len(methods) < 3 {
+		select {
+		case method := <-started:
+			methods[method] = true
+		case <-deadline.C:
+			t.Fatalf("bootstrap requests did not overlap; started %v", methods)
+		}
+	}
+	unblock()
+
+	select {
+	case result := <-done:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.snapshot.Team != "Acme" || result.snapshot.Self.DisplayName() != "Alex" {
+			t.Fatalf("bad identity mapping: %#v", result.snapshot)
+		}
+		if len(result.snapshot.Conversations) != 2 || result.snapshot.Conversations[1].Label() != "@Maya" {
+			t.Fatalf("conversation order or DM mapping changed: %#v", result.snapshot.Conversations)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bootstrap did not finish after all responses were released")
+	}
+}
+
+func TestProgressiveBootstrapRendersBeforeSlowUsersFinish(t *testing.T) {
+	usersStarted := make(chan struct{})
+	releaseUsers := make(chan struct{})
+	var startOnce, releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseUsers) }) }
+	t.Cleanup(release)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		method := strings.TrimPrefix(request.URL.Path, "/")
+		switch method {
+		case "auth.test":
+			writeJSON(writer, `{"ok":true,"user_id":"U1","user":"alex","team":"Acme"}`)
+		case "users.conversations":
+			writeJSON(writer, `{"ok":true,"channels":[{"id":"C1","name":"general"},{"id":"D1","user":"U2","is_im":true}]}`)
+		case "users.list":
+			startOnce.Do(func() { close(usersStarted) })
+			select {
+			case <-releaseUsers:
+				writeJSON(writer, `{"ok":true,"members":[{"id":"U1","name":"alex","profile":{"display_name":"Alex"}},{"id":"U2","name":"maya","profile":{"display_name":"Maya"}}]}`)
+			case <-request.Context().Done():
+			}
+		default:
+			http.Error(writer, `{"ok":false,"error":"unknown_method"}`, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	client, _ := New(Config{Token: "test", BaseURL: server.URL})
+
+	type usersOutcome struct {
+		users map[string]gack.User
+		err   error
+	}
+	usersDone := make(chan usersOutcome, 1)
+	go func() {
+		users, err := client.HydrateUsers(context.Background())
+		usersDone <- usersOutcome{users: users, err: err}
+	}()
+	select {
+	case <-usersStarted:
+	case <-time.After(time.Second):
+		t.Fatal("users.list did not start")
+	}
+
+	coreDone := make(chan struct {
+		snapshot gack.Snapshot
+		err      error
+	}, 1)
+	go func() {
+		snapshot, err := client.BootstrapCore(context.Background())
+		coreDone <- struct {
+			snapshot gack.Snapshot
+			err      error
+		}{snapshot: snapshot, err: err}
+	}()
+	select {
+	case result := <-coreDone:
+		if result.err != nil || result.snapshot.Team != "Acme" || len(result.snapshot.Conversations) != 2 {
+			t.Fatalf("core result = %#v, %v", result.snapshot, result.err)
+		}
+		if label := result.snapshot.Conversations[1].Label(); label != "@U2" {
+			t.Fatalf("unhydrated DM label = %q, want stable fallback", label)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("workspace core waited for users.list")
+	}
+	select {
+	case <-usersDone:
+		t.Fatal("user hydration finished before its response was released")
+	default:
+	}
+	release()
+	select {
+	case result := <-usersDone:
+		if result.err != nil || result.users["U2"].DisplayName() != "Maya" {
+			t.Fatalf("users result = %#v, %v", result.users, result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("user hydration did not finish")
+	}
+}
+
+func TestProgressiveUserFailureDoesNotFailWorkspaceCore(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch strings.TrimPrefix(request.URL.Path, "/") {
+		case "auth.test":
+			writeJSON(writer, `{"ok":true,"user_id":"U1","user":"alex","team":"Acme"}`)
+		case "users.conversations":
+			writeJSON(writer, `{"ok":true,"channels":[{"id":"C1","name":"general"}]}`)
+		case "users.list":
+			writeJSON(writer, `{"ok":false,"error":"ratelimited"}`)
+		}
+	}))
+	defer server.Close()
+	client, _ := New(Config{Token: "test", BaseURL: server.URL})
+
+	if _, err := client.HydrateUsers(context.Background()); err == nil || !strings.Contains(err.Error(), "ratelimited") {
+		t.Fatalf("hydrate error = %v", err)
+	}
+	if snapshot, err := client.BootstrapCore(context.Background()); err != nil || snapshot.Team != "Acme" || len(snapshot.Conversations) != 1 {
+		t.Fatalf("workspace core = %#v, %v", snapshot, err)
+	}
+}
+
+func TestUserHydrationKeepsDeletedAuthorsForHistory(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch strings.TrimPrefix(request.URL.Path, "/") {
+		case "users.list":
+			writeJSON(writer, `{"ok":true,"members":[{"id":"U_OLD","name":"former","deleted":true,"profile":{"real_name":"Former Teammate"}}]}`)
+		case "conversations.history":
+			writeJSON(writer, `{"ok":true,"messages":[{"ts":"1.0","user":"U_OLD","text":"historical context"}]}`)
+		}
+	}))
+	defer server.Close()
+	client, _ := New(Config{Token: "test", BaseURL: server.URL})
+
+	users, err := client.HydrateUsers(context.Background())
+	if err != nil || users["U_OLD"].DisplayName() != "Former Teammate" {
+		t.Fatalf("deleted user metadata = %#v, %v", users["U_OLD"], err)
+	}
+	messages, err := client.Messages(context.Background(), "C1")
+	if err != nil || len(messages) != 1 || messages[0].Username != "Former Teammate" {
+		t.Fatalf("historical message = %#v, %v", messages, err)
+	}
+}
+
+func TestBootstrapCancelsAndJoinsSiblingRequestsOnError(t *testing.T) {
+	allStarted := make(chan struct{})
+	finished := make(chan string, 2)
+	var (
+		startMu    sync.Mutex
+		startCount int
+		startOnce  sync.Once
+	)
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		method := strings.TrimPrefix(request.URL.Path, "/api/")
+		startMu.Lock()
+		startCount++
+		if startCount == 3 {
+			startOnce.Do(func() { close(allStarted) })
+		}
+		startMu.Unlock()
+
+		select {
+		case <-allStarted:
+		case <-request.Context().Done():
+			return nil, request.Context().Err()
+		}
+		if method == "users.list" {
+			return jsonResponse(`{"ok":false,"error":"missing_scope"}`), nil
+		}
+		<-request.Context().Done()
+		finished <- method
+		return nil, request.Context().Err()
+	})
+
+	client, err := New(Config{Token: "test", HTTPClient: &http.Client{Transport: transport}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.Bootstrap(context.Background())
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "load users") || !strings.Contains(err.Error(), "missing_scope") {
+			t.Fatalf("expected initiating users error, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bootstrap did not cancel and join sibling requests")
+	}
+
+	seen := make(map[string]bool, 2)
+	for len(seen) < 2 {
+		select {
+		case method := <-finished:
+			seen[method] = true
+		case <-time.After(time.Second):
+			t.Fatalf("in-flight sibling request was left behind; finished %v", seen)
+		}
+	}
+	if !seen["auth.test"] || !seen["users.conversations"] {
+		t.Fatalf("unexpected canceled siblings: %v", seen)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return function(request)
+}
+
+func jsonResponse(body string) *http.Response {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Status:     http.StatusText(http.StatusOK),
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
 func TestHistoryPagingSendsCursorAndPreservesDisplayOrder(t *testing.T) {
 	var requests []map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		var parameters map[string]any
-		if err := json.NewDecoder(request.Body).Decode(&parameters); err != nil {
-			t.Fatal(err)
+		parameters := map[string]any{}
+		if strings.TrimPrefix(request.URL.Path, "/") == "conversations.replies" {
+			if request.Method != http.MethodGet {
+				t.Errorf("conversations.replies method = %s, want GET", request.Method)
+			}
+			for key, values := range request.URL.Query() {
+				parameters[key] = values[0]
+			}
+		} else {
+			if err := json.NewDecoder(request.Body).Decode(&parameters); err != nil {
+				t.Fatal(err)
+			}
 		}
 		requests = append(requests, parameters)
 		writeJSON(writer, `{"ok":true,"messages":[{"ts":"2.0","text":"new"},{"ts":"1.0","text":"old"}],"response_metadata":{"next_cursor":"next-page"}}`)
@@ -121,7 +409,7 @@ func TestHistoryPagingSendsCursorAndPreservesDisplayOrder(t *testing.T) {
 	if err != nil || len(thread.Messages) != 2 || thread.Messages[0].Text != "new" {
 		t.Fatalf("thread page = %#v, %v", thread, err)
 	}
-	if requests[0]["cursor"] != "cursor-1" || requests[0]["channel"] != "C1" || requests[1]["cursor"] != "cursor-2" || requests[1]["ts"] != "root.1" {
+	if requests[0]["cursor"] != "cursor-1" || requests[0]["channel"] != "C1" || requests[1]["cursor"] != "cursor-2" || requests[1]["channel"] != "C1" || requests[1]["ts"] != "root.1" || requests[1]["limit"] != "15" {
 		t.Fatalf("paging requests = %#v", requests)
 	}
 }

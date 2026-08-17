@@ -22,9 +22,27 @@ func checkUpdateCmd(check func(context.Context) (string, error)) tea.Cmd {
 }
 
 func bootstrapCmd(backend gack.Backend) tea.Cmd {
+	return bootstrapRequestCmd(backend, 0)
+}
+
+func bootstrapRequestCmd(backend gack.Backend, request uint64) tea.Cmd {
 	return (applicationEffect{timeout: 30 * time.Second, run: func(ctx context.Context) applicationEvent {
 		snapshot, err := backend.Bootstrap(ctx)
-		return bootstrapResult{snapshot: snapshot, err: err}
+		return bootstrapResult{request: request, snapshot: snapshot, err: err}
+	}}).command()
+}
+
+func bootstrapCoreCmd(backend gack.ProgressiveBootstrapper, request uint64) tea.Cmd {
+	return (applicationEffect{timeout: 30 * time.Second, run: func(ctx context.Context) applicationEvent {
+		snapshot, err := backend.BootstrapCore(ctx)
+		return bootstrapResult{request: request, progressive: true, snapshot: snapshot, err: err}
+	}}).command()
+}
+
+func hydrateUsersCmd(backend gack.ProgressiveBootstrapper, request uint64) tea.Cmd {
+	return (applicationEffect{timeout: 30 * time.Second, run: func(ctx context.Context) applicationEvent {
+		users, err := backend.HydrateUsers(ctx)
+		return usersResult{request: request, users: users, err: err}
 	}}).command()
 }
 

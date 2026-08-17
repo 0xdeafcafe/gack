@@ -35,7 +35,7 @@ func TestConnectingAndRecoveryStatesAreActionable(t *testing.T) {
 	model.Update(tea.WindowSizeMsg{Width: 120, Height: 36})
 	model.Init()
 	connecting := ansi.Strip(model.View())
-	for _, want := range []string{"CONNECTING TO SLACK", "Opening your workspace", "people, and joined conversations", "q cancel"} {
+	for _, want := range []string{"CONNECTING TO SLACK", "Opening your workspace", "session and joined conversations", "q cancel"} {
 		if !strings.Contains(connecting, want) {
 			t.Errorf("connecting view is missing %q", want)
 		}
@@ -383,10 +383,71 @@ func TestLongSidebarShowsVirtualWindowSortAndDestination(t *testing.T) {
 	model.focus = focusSidebar
 	model.sidebarAt = 42
 	sidebar := ansi.Strip(model.renderSidebar(model.sidebarWidth(), 36))
-	for _, want := range []string{"CHANNELS", " OF 84", "s: MANUAL", "ACTIVE PANE", "›"} {
+	for _, want := range []string{"CHANNELS", " OF 84", "SORT · MANUAL", "[s]", "ACTIVE PANE", "›"} {
 		if !strings.Contains(sidebar, want) {
 			t.Errorf("long sidebar is missing %q", want)
 		}
+	}
+}
+
+func TestNarrowSidebarKeepsChannelTotalAndSortWhole(t *testing.T) {
+	model := readyDemoModel(t, 150, 40)
+	for index := 0; index < 93; index++ {
+		model.channels = append(model.channels, gack.Conversation{ID: fmt.Sprintf("C_%03d", index), Name: fmt.Sprintf("project-%03d", index), IsMember: true})
+	}
+	model.focus = focusSidebar
+	model.sidebarAt = 70
+	sidebar := ansi.Strip(model.renderSidebar(30, 36))
+	for _, want := range []string{"CHANNELS ", " OF 97", "SORT · MANUAL  [s]"} {
+		if !strings.Contains(sidebar, want) {
+			t.Errorf("30-column sidebar is missing %q:\n%s", want, sidebar)
+		}
+	}
+	if strings.Contains(sidebar, "CHANNELS 55–80 OF  ") {
+		t.Fatalf("channel total was clipped:\n%s", sidebar)
+	}
+}
+
+func TestBlockKitTextReplacesFallbackWithoutLosingLinksOrControls(t *testing.T) {
+	model := readyDemoModel(t, 120, 36)
+	blocks, err := gack.ParseBlocks([]byte(`[
+  {"type":"rich_text","elements":[{"type":"rich_text_section","elements":[
+    {"type":"broadcast","range":"here"},{"type":"text","text":" Read "},
+    {"type":"link","url":"https://example.com/runbook","text":"the runbook"}
+  ]}]},
+  {"type":"actions","elements":[{"type":"button","action_id":"ack","text":{"type":"plain_text","text":"Acknowledge"}}]}
+]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rendered := ansi.Strip(model.renderMessage(gack.Message{
+		Username: "Deploy bot",
+		Text:     "FALLBACK ONLY <!here> Read the runbook https://example.com/runbook",
+		Blocks:   blocks,
+	}, 90, true, 0))
+	if strings.Contains(rendered, "FALLBACK ONLY") {
+		t.Fatalf("fallback was rendered alongside Block Kit:\n%s", rendered)
+	}
+	for _, want := range []string{"@here Read the runbook (https://example.com/runbook)", "[1 Acknowledge]"} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("rendered Block Kit is missing %q:\n%s", want, rendered)
+		}
+	}
+
+	controlsOnly := ansi.Strip(model.renderMessage(gack.Message{
+		Username: "Deploy bot",
+		Text:     "Choose a deployment action",
+		Blocks:   []gack.Block{{Type: "actions", Elements: []gack.Element{{Type: "button", ActionID: "go", Text: "Deploy"}}}},
+	}, 90, false, 0))
+	for _, want := range []string{"Choose a deployment action", "[Deploy]"} {
+		if !strings.Contains(controlsOnly, want) {
+			t.Errorf("controls-only message is missing %q:\n%s", want, controlsOnly)
+		}
+	}
+
+	textOnly := ansi.Strip(model.renderMessage(gack.Message{Username: "Human", Text: "plain Slack text"}, 90, false, 0))
+	if !strings.Contains(textOnly, "plain Slack text") {
+		t.Fatalf("text-only message disappeared:\n%s", textOnly)
 	}
 }
 

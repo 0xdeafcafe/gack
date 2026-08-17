@@ -121,28 +121,138 @@ type conversationsResponse struct {
 	} `json:"response_metadata"`
 }
 
-func (c *Client) Bootstrap(ctx context.Context) (gack.Snapshot, error) {
-	var auth authResponse
-	if err := c.call(ctx, "auth.test", nil, &auth); err != nil {
-		return gack.Snapshot{}, err
+// BootstrapCore deliberately excludes users.list. Large workspaces can take
+// many cursor pages to enumerate, while auth.test and users.conversations are
+// enough to render a useful workspace and start loading message history.
+func (c *Client) BootstrapCore(ctx context.Context) (gack.Snapshot, error) {
+	bootstrapCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		auth     authResponse
+		channels []gack.Conversation
+		failure  struct {
+			stage string
+			err   error
+		}
+		failOnce sync.Once
+		workers  sync.WaitGroup
+	)
+	fetch := func(stage string, run func() error) {
+		defer workers.Done()
+		if err := run(); err != nil {
+			failOnce.Do(func() {
+				failure.stage = stage
+				failure.err = err
+				cancel()
+			})
+		}
 	}
+
+	workers.Add(2)
+	go fetch("auth", func() error { return c.call(bootstrapCtx, "auth.test", nil, &auth) })
+	go fetch("conversations", func() error {
+		var err error
+		channels, err = c.loadConversations(bootstrapCtx)
+		return err
+	})
+	workers.Wait()
+	if failure.err != nil {
+		if failure.stage == "conversations" {
+			return gack.Snapshot{}, fmt.Errorf("load conversations: %w", failure.err)
+		}
+		return gack.Snapshot{}, failure.err
+	}
+
+	c.mu.Lock()
+	c.selfID = auth.UserID
+	users := c.users
+	c.mu.Unlock()
+	resolveConversationUsers(channels, users)
+	self := users[auth.UserID]
+	if self.ID == "" {
+		self = gack.User{ID: auth.UserID, Name: auth.User, RealName: auth.User}
+	}
+	return gack.Snapshot{Team: auth.Team, Self: self, Users: users, Conversations: channels}, nil
+}
+
+// HydrateUsers enriches a progressively bootstrapped workspace without being a
+// prerequisite for rendering it. The client cache also improves subsequent
+// message conversions even when hydration finishes after history loading.
+func (c *Client) HydrateUsers(ctx context.Context) (map[string]gack.User, error) {
 	users, err := c.loadUsers(ctx)
 	if err != nil {
-		return gack.Snapshot{}, fmt.Errorf("load users: %w", err)
+		return nil, fmt.Errorf("load users: %w", err)
+	}
+	c.mu.Lock()
+	c.users = users
+	c.mu.Unlock()
+	return users, nil
+}
+
+func (c *Client) Bootstrap(ctx context.Context) (gack.Snapshot, error) {
+	bootstrapCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		auth     authResponse
+		users    map[string]gack.User
+		channels []gack.Conversation
+		failure  struct {
+			stage string
+			err   error
+		}
+		failOnce sync.Once
+		workers  sync.WaitGroup
+	)
+	fetch := func(stage string, run func() error) {
+		defer workers.Done()
+		if err := run(); err != nil {
+			failOnce.Do(func() {
+				failure.stage = stage
+				failure.err = err
+				cancel()
+			})
+		}
+	}
+
+	// These datasets are independent on the wire. DM labels are resolved from
+	// the user map only after every request has completed, keeping startup to the
+	// duration of the slowest pagination stream instead of the sum of all three.
+	workers.Add(3)
+	go fetch("auth", func() error { return c.call(bootstrapCtx, "auth.test", nil, &auth) })
+	go fetch("users", func() error {
+		var err error
+		users, err = c.loadUsers(bootstrapCtx)
+		return err
+	})
+	go fetch("conversations", func() error {
+		var err error
+		channels, err = c.loadConversations(bootstrapCtx)
+		return err
+	})
+	workers.Wait()
+
+	if failure.err != nil {
+		switch failure.stage {
+		case "users":
+			return gack.Snapshot{}, fmt.Errorf("load users: %w", failure.err)
+		case "conversations":
+			return gack.Snapshot{}, fmt.Errorf("load conversations: %w", failure.err)
+		default:
+			return gack.Snapshot{}, failure.err
+		}
+	}
+
+	resolveConversationUsers(channels, users)
+	self := users[auth.UserID]
+	if self.ID == "" {
+		self = gack.User{ID: auth.UserID, Name: auth.User, RealName: auth.User}
 	}
 	c.mu.Lock()
 	c.selfID = auth.UserID
 	c.users = users
 	c.mu.Unlock()
-
-	channels, err := c.loadConversations(ctx, users)
-	if err != nil {
-		return gack.Snapshot{}, fmt.Errorf("load conversations: %w", err)
-	}
-	self := users[auth.UserID]
-	if self.ID == "" {
-		self = gack.User{ID: auth.UserID, Name: auth.User, RealName: auth.User}
-	}
 	return gack.Snapshot{Team: auth.Team, Self: self, Users: users, Conversations: channels}, nil
 }
 
@@ -159,9 +269,8 @@ func (c *Client) loadUsers(ctx context.Context) (map[string]gack.User, error) {
 			return nil, err
 		}
 		for _, source := range response.Members {
-			if source.Deleted {
-				continue
-			}
+			// Deleted accounts still own historical messages. Keep their profile
+			// metadata so old conversations do not degrade to "unknown".
 			realName := source.Profile.DisplayName
 			if realName == "" {
 				realName = source.Profile.RealName
@@ -176,7 +285,7 @@ func (c *Client) loadUsers(ctx context.Context) (map[string]gack.User, error) {
 	return users, nil
 }
 
-func (c *Client) loadConversations(ctx context.Context, users map[string]gack.User) ([]gack.Conversation, error) {
+func (c *Client) loadConversations(ctx context.Context) ([]gack.Conversation, error) {
 	var result []gack.Conversation
 	seen := make(map[string]struct{}, c.channelLimit)
 	cursor := ""
@@ -208,14 +317,13 @@ func (c *Client) loadConversations(ctx context.Context, users map[string]gack.Us
 			}
 			seen[source.ID] = struct{}{}
 			name := source.Name
-			display := ""
-			if source.IsIM {
-				user := users[source.User]
-				name = user.Name
-				display = "@" + user.DisplayName()
+			if source.IsIM && name == "" {
+				// Keep DMs distinguishable until the optional users.list hydration
+				// replaces this stable ID with the person's display name.
+				name = source.User
 			}
 			result = append(result, gack.Conversation{
-				ID: source.ID, Name: name, DisplayName: display, UserID: source.User,
+				ID: source.ID, Name: name, UserID: source.User,
 				Topic: source.Topic.Value, IsDM: source.IsIM, IsPrivate: source.IsPrivate,
 				// users.conversations is membership-scoped and may omit is_member.
 				IsMember: true, IsArchived: source.IsArchived,
@@ -228,6 +336,21 @@ func (c *Client) loadConversations(ctx context.Context, users map[string]gack.Us
 		}
 	}
 	return result, nil
+}
+
+func resolveConversationUsers(conversations []gack.Conversation, users map[string]gack.User) {
+	for index := range conversations {
+		conversation := &conversations[index]
+		if !conversation.IsDM {
+			continue
+		}
+		user, ok := users[conversation.UserID]
+		if !ok {
+			continue
+		}
+		conversation.Name = user.Name
+		conversation.DisplayName = "@" + user.DisplayName()
+	}
 }
 
 type slackReaction struct {
@@ -292,7 +415,10 @@ func (c *Client) ThreadPage(ctx context.Context, channel, thread, cursor string)
 	if cursor != "" {
 		params["cursor"] = cursor
 	}
-	if err := c.call(ctx, "conversations.replies", params, &response); err != nil {
+	// Unlike the other Web API methods used here, conversations.replies does
+	// not reliably consume a JSON POST body. Send its documented read
+	// arguments in the query string so Slack actually receives channel and ts.
+	if err := c.callQuery(ctx, "conversations.replies", params, &response); err != nil {
 		return gack.HistoryPage{}, err
 	}
 	return gack.HistoryPage{
@@ -314,7 +440,9 @@ func (c *Client) convertMessages(channel string, messages []slackMessage) []gack
 			username = source.BotProfile.Name
 		}
 		if username == "" {
-			username = users[source.User].DisplayName()
+			if user, ok := users[source.User]; ok {
+				username = user.DisplayName()
+			}
 		}
 		message := gack.Message{
 			TS: source.TS, ThreadTS: source.ThreadTS, ChannelID: channel, UserID: source.User,
@@ -482,20 +610,43 @@ func (e *APIError) Error() string {
 }
 
 func (c *Client) call(ctx context.Context, method string, params map[string]any, output any) error {
+	return c.callWithTransport(ctx, http.MethodPost, method, params, output)
+}
+
+func (c *Client) callQuery(ctx context.Context, method string, params map[string]any, output any) error {
+	return c.callWithTransport(ctx, http.MethodGet, method, params, output)
+}
+
+func (c *Client) callWithTransport(ctx context.Context, httpMethod, method string, params map[string]any, output any) error {
 	if params == nil {
 		params = map[string]any{}
 	}
-	body, err := json.Marshal(params)
-	if err != nil {
-		return err
+	endpoint := c.baseURL + url.PathEscape(method)
+	var body []byte
+	if httpMethod == http.MethodGet {
+		query := url.Values{}
+		for key, value := range params {
+			query.Set(key, fmt.Sprint(value))
+		}
+		if encoded := query.Encode(); encoded != "" {
+			endpoint += "?" + encoded
+		}
+	} else {
+		var err error
+		body, err = json.Marshal(params)
+		if err != nil {
+			return err
+		}
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+url.PathEscape(method), bytes.NewReader(body))
+		request, err := http.NewRequestWithContext(ctx, httpMethod, endpoint, bytes.NewReader(body))
 		if err != nil {
 			return err
 		}
 		request.Header.Set("Authorization", "Bearer "+c.token)
-		request.Header.Set("Content-Type", "application/json; charset=utf-8")
+		if httpMethod != http.MethodGet {
+			request.Header.Set("Content-Type", "application/json; charset=utf-8")
+		}
 		response, err := c.http.Do(request)
 		if err != nil {
 			return fmt.Errorf("Slack %s: %w", method, err)

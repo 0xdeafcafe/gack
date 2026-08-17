@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"slices"
 	"testing"
 
@@ -180,5 +181,38 @@ func TestMouseDragFromComputedSortBecomesManual(t *testing.T) {
 	}
 	if saved.Sort != config.SidebarSortManual || !slices.Equal(saved.ChannelOrder, want) {
 		t.Fatalf("drag saved %#v, want manual %v", saved, want)
+	}
+}
+
+func TestSidebarClickDoesNotRecenterUntilReleaseAndClearsStaleHover(t *testing.T) {
+	model := readyDemoModel(t, 150, 28)
+	for index := 0; index < 60; index++ {
+		model.channels = append(model.channels, gack.Conversation{
+			ID: fmt.Sprintf("mouse-%02d", index), Name: fmt.Sprintf("mouse-%02d", index),
+		})
+	}
+	model.focus = focusSidebar
+	model.sidebarAt = 2
+	model.View()
+	if len(model.visibleSidebarHits) < 2 {
+		t.Fatal("test needs multiple visible channels")
+	}
+	target := model.visibleSidebarHits[len(model.visibleSidebarHits)-1]
+	previousSelection := model.sidebarAt
+
+	model.updateMouse(tea.MouseMsg{X: 2, Y: target.y, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	if model.sidebarAt != previousSelection {
+		t.Fatalf("mouse press recentered selection from %d to %d", previousSelection, model.sidebarAt)
+	}
+	if model.dragFrom != target.channelIndex {
+		t.Fatalf("press target = %d, want %d", model.dragFrom, target.channelIndex)
+	}
+
+	_, command := model.updateMouse(tea.MouseMsg{X: 2, Y: target.y, Button: tea.MouseButtonLeft, Action: tea.MouseActionRelease})
+	if command == nil {
+		t.Fatal("channel click did not request its conversation")
+	}
+	if model.channel != target.channelIndex || model.hoverPane != focus(-1) || model.hoverSidebarAt != -1 {
+		t.Fatalf("release channel=%d hover=(%d,%d), want channel=%d and cleared hover", model.channel, model.hoverPane, model.hoverSidebarAt, target.channelIndex)
 	}
 }

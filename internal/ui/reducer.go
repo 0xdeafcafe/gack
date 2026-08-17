@@ -14,16 +14,35 @@ import (
 func (m *Model) reduce(event applicationEvent) tea.Cmd {
 	switch event := event.(type) {
 	case bootstrapResult:
+		if event.request != 0 {
+			if event.request != m.bootstrapRequest || event.request <= m.bootstrapApplied {
+				return nil
+			}
+			m.bootstrapApplied = event.request
+		}
 		m.busy = ""
 		if event.err != nil {
 			m.err = event.err.Error()
 			return nil
 		}
-		m.snapshot = event.snapshot
-		m.channels = config.ApplyOrder(event.snapshot.Conversations, func(channel gack.Conversation) string { return channel.ID }, m.order)
+		snapshot := event.snapshot
+		if event.progressive {
+			// User hydration is independent and may win the race. Never replace a
+			// successfully hydrated map with the deliberately sparse core result.
+			if m.usersReady {
+				snapshot.Users = m.snapshot.Users
+			}
+			hydrateSnapshotUsers(&snapshot, snapshot.Users)
+		} else {
+			m.usersReady = true
+			m.usersLoading = false
+			m.usersErr = ""
+		}
+		m.snapshot = snapshot
+		m.channels = config.ApplyOrder(snapshot.Conversations, func(channel gack.Conversation) string { return channel.ID }, m.order)
 		m.order = m.channelOrder()
 		m.sortChannels(m.sidebarSort)
-		m.activity = append([]gack.ActivityItem(nil), event.snapshot.Activity...)
+		m.activity = append([]gack.ActivityItem(nil), snapshot.Activity...)
 		m.ready = true
 		if len(m.channels) == 0 {
 			m.err = "No joined conversations are visible to this token"
@@ -34,6 +53,26 @@ func (m *Model) reduce(event applicationEvent) tea.Cmd {
 		m.focus = focusMessages
 		m.busy = "Loading messages…"
 		return messagesCmd(m.backend, m.channels[m.channel].ID)
+	case usersResult:
+		if event.request != m.usersRequest || event.request <= m.usersApplied {
+			return nil
+		}
+		m.usersApplied = event.request
+		m.usersLoading = false
+		if event.err != nil {
+			m.usersErr = event.err.Error()
+			if m.ready {
+				m.status = ""
+			}
+			return nil
+		}
+		m.usersReady = true
+		m.usersErr = ""
+		hydrateSnapshotUsers(&m.snapshot, event.users)
+		hydrateConversationUsers(m.channels, event.users)
+		if m.ready {
+			m.status = "People details updated"
+		}
 	case versionResult:
 		if event.err == nil {
 			m.updateAvailable = event.latest
@@ -221,4 +260,32 @@ func (m *Model) reduce(event applicationEvent) tea.Cmd {
 		}
 	}
 	return nil
+}
+
+func hydrateSnapshotUsers(snapshot *gack.Snapshot, users map[string]gack.User) {
+	if users == nil {
+		users = map[string]gack.User{}
+	}
+	snapshot.Users = users
+	if self, ok := users[snapshot.Self.ID]; ok {
+		snapshot.Self = self
+	}
+	hydrateConversationUsers(snapshot.Conversations, users)
+}
+
+func hydrateConversationUsers(conversations []gack.Conversation, users map[string]gack.User) {
+	for index := range conversations {
+		conversation := &conversations[index]
+		if !conversation.IsDM {
+			continue
+		}
+		user, ok := users[conversation.UserID]
+		if !ok {
+			continue
+		}
+		if user.Name != "" {
+			conversation.Name = user.Name
+		}
+		conversation.DisplayName = "@" + user.DisplayName()
+	}
 }

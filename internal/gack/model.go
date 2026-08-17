@@ -20,6 +20,16 @@ type Backend interface {
 	Interact(context.Context, Interaction) (InteractionResult, error)
 }
 
+// ProgressiveBootstrapper is an optional backend capability for services where
+// loading every user's profile can be much slower than opening the workspace.
+// BootstrapCore must return identity and conversations without depending on
+// HydrateUsers. The UI runs both operations independently and serializes their
+// results through its event reducer.
+type ProgressiveBootstrapper interface {
+	BootstrapCore(context.Context) (Snapshot, error)
+	HydrateUsers(context.Context) (map[string]User, error)
+}
+
 // HistoryPager is an optional backend capability. The UI discovers it at
 // runtime, so small embedders can keep implementing Backend while Slack-backed
 // sessions gain incremental history without loading an unbounded transcript.

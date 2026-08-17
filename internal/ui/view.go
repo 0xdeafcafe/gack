@@ -145,6 +145,9 @@ func (m *Model) renderFooter() string {
 		style = errorStyle
 	case m.busy != "":
 		value = "◌ " + m.busy
+	case m.usersErr != "":
+		value = "People details unavailable · U retry · " + m.usersErr
+		style = lipgloss.NewStyle().Foreground(warning)
 	case m.status != "":
 		value = m.status
 		style = successStyle
@@ -221,7 +224,7 @@ func (m *Model) renderStartup(height int) string {
 			"",
 			m.spin.View() + "  Opening your workspace",
 			"",
-			dimStyle.Render("Checking the session, people, and joined conversations."),
+			dimStyle.Render("Checking the session and joined conversations."),
 		}
 		if time.Since(m.connectStarted) > 8*time.Second {
 			lines = append(lines, "", dimStyle.Render("Still working — large workspaces can take a few seconds."))
@@ -293,7 +296,11 @@ func (m *Model) renderSidebar(width, height int) string {
 		m.sidebarLine("  ◷  Activity", len(m.activity), m.sidebarAt == 1 && m.focus == focusSidebar, m.mode == viewActivity, m.hoverSidebarAt == 1, innerWidth),
 		"",
 	)
-	available := max(0, innerHeight-len(lines)-1)
+	// Count and sort are separate at the sidebar's normal width. Keeping both
+	// labels whole is more useful than allowing joinAcross to preserve the sort
+	// control by silently clipping the total channel count.
+	const sidebarStatusRows = 2
+	available := max(0, innerHeight-len(lines)-sidebarStatusRows)
 	cursor := m.channel
 	if m.sidebarAt >= 2 {
 		cursor = m.sidebarAt - 2
@@ -327,14 +334,15 @@ func (m *Model) renderSidebar(width, height int) string {
 		rangeLabel = fmt.Sprintf("CHANNELS %d–%d OF %d", channelsBefore+1, channelsBefore+channelsShown, len(m.channels))
 	}
 	if len(m.sidebarGroupRules) > 0 {
-		if innerWidth < 36 {
-			rangeLabel = fmt.Sprintf("%d CH · %d GRP", len(m.channels), len(m.sidebarGroupRules))
-		} else {
-			rangeLabel += fmt.Sprintf(" · %d GROUPS", len(m.sidebarGroupRules))
+		withGroups := rangeLabel + fmt.Sprintf(" · %d GROUPS", len(m.sidebarGroupRules))
+		if lipgloss.Width("  "+withGroups) <= innerWidth {
+			rangeLabel = withGroups
 		}
 	}
-	sortLabel := "s: " + strings.ToUpper(m.sidebarSortLabel())
-	lines = append(lines, joinAcross(dimStyle.Render("  "+rangeLabel), dimStyle.Render(sortLabel), innerWidth))
+	lines = append(lines,
+		dimStyle.Render(truncate("  "+rangeLabel, innerWidth)),
+		dimStyle.Render(truncate("  SORT · "+strings.ToUpper(m.sidebarSortLabel())+"  [s]", innerWidth)),
+	)
 	m.visibleSidebarHits = m.visibleSidebarHits[:0]
 	m.visibleChannelStart = 0
 	m.channelRowStart = 0
@@ -678,6 +686,13 @@ func (m *Model) renderMessageGrouped(message gack.Message, width int, selected b
 	bodyWidth := max(8, width-2)
 	lines := []string{heading}
 	text := strings.TrimSpace(formatSlackText(message.Text, m.snapshot.Users, m.channels))
+	if blocksContainPrimaryText(message.Blocks) {
+		// Slack's top-level text is an accessibility and notification fallback
+		// when blocks are present. Block text is the visible message, and showing
+		// both produces the same content twice with slightly different mention or
+		// link formatting. Controls-only blocks keep the fallback as context.
+		text = ""
+	}
 	if text != "" {
 		for _, line := range wrapText(text, bodyWidth) {
 			lines = append(lines, "  "+line)
@@ -748,6 +763,21 @@ func (m *Model) renderMessageGrouped(message gack.Message, width int, selected b
 		messageView = styleLines(messageView, selectedRow, width)
 	}
 	return messageView
+}
+
+func blocksContainPrimaryText(blocks []gack.Block) bool {
+	for _, block := range blocks {
+		text := strings.TrimSpace(block.Text)
+		if text != "" && !strings.HasPrefix(text, "Unsupported Block Kit block:") {
+			return true
+		}
+		for _, element := range block.Elements {
+			if element.Type == "field" && strings.TrimSpace(element.Text) != "" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func messagesAreGrouped(previous, current gack.Message) bool {
