@@ -36,7 +36,7 @@ func TestCheckerFetchesAndCachesLatestVersion(t *testing.T) {
 		if request.Header.Get("User-Agent") != "gack/0.3.0" {
 			t.Errorf("User-Agent = %q", request.Header.Get("User-Agent"))
 		}
-		fmt.Fprint(writer, `{"Version":"v0.4.0","Time":"2026-08-17T00:00:00Z"}`)
+		fmt.Fprint(writer, `[{"name":"v0.4.0"},{"name":"not-a-release"},{"name":"v0.3.0"}]`)
 	}))
 	defer server.Close()
 
@@ -66,7 +66,7 @@ func TestCheckerFetchesAndCachesLatestVersion(t *testing.T) {
 
 func TestCheckerRejectsInvalidVersions(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(writer, `{"Version":"definitely-not-a-release"}`)
+		fmt.Fprint(writer, `[{"name":"definitely-not-a-release"}]`)
 	}))
 	defer server.Close()
 	checker := Checker{Client: server.Client(), Endpoint: server.URL, Now: time.Now}

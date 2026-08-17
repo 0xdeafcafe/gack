@@ -19,7 +19,7 @@ import (
 const (
 	ModulePath      = "github.com/0xdeafcafe/gack"
 	CommandPath     = ModulePath + "/cmd/gack"
-	DefaultEndpoint = "https://proxy.golang.org/github.com/0xdeafcafe/gack/@latest"
+	DefaultEndpoint = "https://api.github.com/repos/0xdeafcafe/gack/tags?per_page=100"
 	defaultMaxAge   = 6 * time.Hour
 	maximumResponse = 64 << 10
 )
@@ -45,9 +45,9 @@ type cacheRecord struct {
 	CheckedAt time.Time `json:"checked_at"`
 }
 
-// DefaultChecker uses Go's public module proxy. That keeps version discovery
-// tied to the same signed module/tag path used by `go install`, and does not
-// require GitHub credentials or a GitHub Release object.
+// DefaultChecker reads public repository tags without credentials or requiring
+// a GitHub Release object. Installation remains pinned to the discovered tag
+// through `go install`, including normal module checksum verification.
 func DefaultChecker() Checker {
 	path := ""
 	if root, err := os.UserCacheDir(); err == nil {
@@ -75,7 +75,7 @@ func (checker Checker) Check(ctx context.Context, current string, force bool) (R
 	if err != nil {
 		return Result{}, fmt.Errorf("prepare update check: %w", err)
 	}
-	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Accept", "application/vnd.github+json")
 	request.Header.Set("User-Agent", "gack/"+strings.TrimPrefix(current, "v"))
 	response, err := checker.Client.Do(request)
 	if err != nil {
@@ -92,20 +92,51 @@ func (checker Checker) Check(ctx context.Context, current string, force bool) (R
 	if len(data) > maximumResponse {
 		return Result{}, errors.New("update response is unexpectedly large")
 	}
-	var latest struct {
-		Version string `json:"Version"`
-	}
-	if err := json.Unmarshal(data, &latest); err != nil {
-		return Result{}, fmt.Errorf("decode update response: %w", err)
-	}
-	latest.Version = strings.TrimSpace(latest.Version)
-	if _, ok := parseVersion(latest.Version); !ok {
-		return Result{}, fmt.Errorf("update service returned invalid version %q", latest.Version)
+	latest, err := decodeLatestVersion(data)
+	if err != nil {
+		return Result{}, err
 	}
 
-	record := cacheRecord{Version: latest.Version, CheckedAt: now}
+	record := cacheRecord{Version: latest, CheckedAt: now}
 	checker.writeCache(record) // A cache failure must never make startup fail.
 	return resultFor(current, record.Version, record.CheckedAt, false), nil
+}
+
+func decodeLatestVersion(data []byte) (string, error) {
+	// Accept the Go proxy object as a compatibility format for embedders that
+	// override Endpoint, while the default endpoint uses GitHub's tag list.
+	var module struct {
+		Version string `json:"Version"`
+	}
+	if json.Unmarshal(data, &module) == nil {
+		module.Version = strings.TrimSpace(module.Version)
+		if _, ok := parseVersion(module.Version); ok {
+			return module.Version, nil
+		}
+	}
+
+	var tags []struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(data, &tags); err != nil {
+		return "", fmt.Errorf("decode update response: %w", err)
+	}
+	latest := ""
+	var latestParsed parsedVersion
+	for _, tag := range tags {
+		name := strings.TrimSpace(tag.Name)
+		parsed, ok := parseVersion(name)
+		if !ok || len(parsed.prerelease) > 0 {
+			continue
+		}
+		if latest == "" || compareVersions(latestParsed, parsed) < 0 {
+			latest, latestParsed = name, parsed
+		}
+	}
+	if latest == "" {
+		return "", errors.New("update service returned no semantic release tags")
+	}
+	return latest, nil
 }
 
 func (checker Checker) withDefaults() Checker {
